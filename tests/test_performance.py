@@ -279,3 +279,43 @@ def test_vector_transform_validates_matrix_without_objects(e):
     e.call("paint_layer", action="create", name="empty", kind="vector")
     with pytest.raises(ValueError, match="Singular"):
         e.call("paint_transform", matrix=[0, 0, 0, 0, 0, 0], layer_id="empty")
+
+
+# --- 6. Vectorised flood fill ------------------------------------------------------------------------
+
+def reference_flood(image, x, y, tolerance):
+    """The previous implementation: Pillow's pure-Python ImageDraw.floodfill on a barrier image."""
+    from PIL import ImageDraw
+    arr = np.asarray(image).astype(np.int16)
+    arr[arr[..., 3] == 0, :3] = 0
+    distance = np.max(np.abs(arr - arr[y, x]), axis=2)
+    barrier = Image.fromarray(np.uint8(distance > tolerance) * 255).convert("RGB")
+    ImageDraw.floodfill(barrier, (x, y), (127, 0, 0), thresh=0)
+    return Image.fromarray(np.uint8(np.asarray(barrier)[..., 0] == 127) * 255)
+
+
+def flood_cases():
+    from PIL import ImageDraw
+    rng = np.random.default_rng(21)
+    noise = rng.integers(0, 256, (70, 90, 4), dtype=np.uint8)
+    noise[rng.random((70, 90)) < .2, 3] = 0  # transparent pixels that keep a hidden RGB
+    yield Image.fromarray(noise), [(0, 0), (40, 30), (89, 69)], [0, 30, 64.5, 140, 255]
+    walls = np.full((80, 100, 4), 255, np.uint8)
+    walls[::9, :, :3] = 0; walls[:, ::13, :3] = 0; walls[40:44, 30:70] = 0
+    yield Image.fromarray(walls), [(1, 1), (50, 41), (99, 79)], [0, 10]
+    maze = Image.new("RGBA", (120, 100), (255, 255, 255, 255)); draw = ImageDraw.Draw(maze)
+    for k, inset in enumerate(range(2, 46, 4)):  # nested frames with alternating gaps: a winding corridor
+        draw.rectangle([inset, inset, 119 - inset, 99 - inset], outline=(0, 0, 0, 255))
+        gap_y = inset if k % 2 == 0 else 99 - inset
+        draw.line([40 + 40 * (k % 2), gap_y, 42 + 40 * (k % 2), gap_y], fill=(255, 255, 255, 255))
+    yield maze, [(0, 0), (60, 50), (5, 50)], [0, 254.5]
+    yield Image.new("RGBA", (40, 30)), [(0, 0), (39, 29)], [0]
+
+
+def test_flood_region_matches_previous_algorithm():
+    from csp_headless.render import flood_region
+    for image, seeds, tolerances in flood_cases():
+        for x, y in seeds:
+            for tolerance in tolerances:
+                expected = reference_flood(image, x, y, tolerance)
+                assert flood_region(image, x, y, tolerance).tobytes() == expected.tobytes(), (image.size, x, y, tolerance)

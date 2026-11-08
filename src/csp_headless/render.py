@@ -1134,6 +1134,62 @@ def pattern_coverage(kind, box, params):
     return image, count
 
 
+def _runs_touching(allowed, filled):
+    """Within each row: the runs of allowed pixels that contain a filled pixel."""
+    height, width = allowed.shape
+    a = allowed.ravel()
+    starts = a.copy()
+    starts[1:] &= ~a[:-1]
+    starts[::width] = a[::width]  # a run never continues onto the next row
+    run = np.cumsum(starts, dtype=np.int32)
+    hit = np.zeros(int(run[-1])+1, dtype=bool)
+    hit[run[filled.ravel() & a]] = True
+    return (a & hit[run]).reshape(height, width)
+
+
+def _connected(allowed, x, y):
+    """4-connected component of `allowed` containing (x, y). Row and column runs alternate, and only
+    rows/columns that changed in the previous half-pass are revisited, so work follows the region."""
+    filled = np.zeros_like(allowed)
+    filled[y, x] = True
+    rows = np.array([y])
+    while True:
+        before = filled[rows]
+        grown = _runs_touching(np.ascontiguousarray(allowed[rows]), before)
+        filled[rows] = grown
+        cols = np.flatnonzero((grown != before).any(axis=0))
+        if not cols.size:
+            return filled
+        before = np.ascontiguousarray(filled[:, cols].T)
+        grown = _runs_touching(np.ascontiguousarray(allowed[:, cols].T), before)
+        filled[:, cols] = grown.T
+        rows = np.flatnonzero((grown != before).any(axis=0))
+        if not rows.size:
+            return filled
+
+
+def flood_region(image, x, y, tolerance):
+    """Mask (L, 0/255) of the 4-connected area around (x, y) whose RGBA channels all lie within
+    tolerance of the seed pixel. Fully transparent pixels compare as RGB 0: their stored colour is
+    invisible and must not become a barrier."""
+    arr = np.asarray(image)
+    clear = arr[..., 3] == 0
+    target = arr[y, x].astype(np.int64)
+    if target[3] == 0:
+        target[:3] = 0
+    allowed = np.ones(clear.shape, dtype=bool)
+    for channel in range(4):
+        # Integer bounds of |value - target| <= tolerance (tolerance may be fractional).
+        low = max(0, math.ceil(target[channel]-tolerance))
+        high = min(255, math.floor(target[channel]+tolerance))
+        values = arr[..., channel]
+        inside = (values >= low) & (values <= high)
+        if channel < 3:
+            inside = np.where(clear, low == 0, inside)
+        allowed &= inside
+    return Image.fromarray(np.uint8(_connected(allowed, x, y))*255)
+
+
 def stroke_patch(size, points, brush, color, closed=False, smooth=False, dash=None, dash_offset=0.0):
     """A retained stroke rendered on its own: (box, RGBA patch) or None.
 

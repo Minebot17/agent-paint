@@ -19,7 +19,8 @@ from . import __version__
 from .model import Document, Layer, BLENDS, dimensions, finite, uid
 from .render import (BRUSH_DEFAULTS, BRUSH_KINDS, FILTER_KINDS, PATTERN_DEFAULT_DENSITY, PATTERN_KINDS, RESAMPLING,
                      TEXT_ALIGNS, TEXT_ANCHORS, TEXT_STYLE_KEYS, TEXTURE_SPACES,
-                     add_noise, apply_paint, blend, channel_shift, composite, composite_region, font_for, fonts, gaussian_blur,
+                     add_noise, apply_paint, blend, channel_shift, composite, composite_region, flood_region, font_for, fonts,
+                     gaussian_blur,
                      hard_polygon_mask, missing_glyphs, object_pixels, paint_stroke, paper_noise, pattern_coverage,
                      relief, render_objects, rgba, shape_patch, smooth_outline, text_bounds, transformed,
                      validate_affine, validate_brush, validate_dash, validate_gradient, validate_points)
@@ -571,19 +572,11 @@ class Engine:
         return box
 
     def _flood(self,point,tolerance,sample_merged=False,layer_id=None):
-        from PIL import ImageDraw
         if point is None or len(point)!=2: raise ValueError("point=[x,y] is required")
         x,y=map(round,point); finite(tolerance,0,255,"tolerance")
         if not 0<=x<self.doc.width or not 0<=y<self.doc.height: raise ValueError("Flood point outside document")
         image=composite(self.doc) if sample_merged else self.doc.layer(layer_id).image
-        # Floodfill uses a sentinel in a separate RGB image to preserve original pixels and alpha.
-        arr=np.asarray(image).astype(np.int16)
-        arr[arr[...,3]==0,:3]=0  # Invisible stored RGB must not become a flood barrier.
-        target=arr[y,x]
-        distance=np.max(np.abs(arr-target),axis=2)
-        barrier=Image.fromarray(np.uint8(distance>tolerance)*255).convert("RGB")
-        ImageDraw.floodfill(barrier,(x,y),(127,0,0),thresh=0)
-        return Image.fromarray(np.uint8(np.asarray(barrier)[...,0]==127)*255)
+        return flood_region(image,x,y,tolerance)
 
     @staticmethod
     def _selection_box(rectangle):
