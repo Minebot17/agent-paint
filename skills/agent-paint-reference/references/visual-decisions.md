@@ -1,7 +1,7 @@
 # Artistic decisions transferred from the reference studies
 
-Open [examples/accepted-face-c-d.png](examples/accepted-face-c-d.png) before relying on this example.
-It shows the reference, CSP C and CSP D. The user explicitly preferred D's face. Its finer nose/mouth,
+The comparison behind this example (reference, CSP C and CSP D) is not distributed because the
+reference is a copyrighted cover. The user explicitly preferred D's face. Its finer nose/mouth,
 cheek/jaw contour and gaze are the positive result. D still has oversized circular irises and simpler
 planes than the source. Preserve attractiveness and expression while judging likeness separately;
 do not transplant these exact features to a different person/reference.

@@ -7,8 +7,8 @@ preferred artistic baseline. The user did not give reasons for this preference; 
 below are the agent's visual assessment. This is one study with engine, skill and execution
 conditions changed together. It does not isolate a causal effect of the skill/renderer.
 
-Open [examples/face-d-e.png](examples/face-d-e.png) for face work and
-[examples/materials-d-e.png](examples/materials-d-e.png) for hair/cloth work. Columns are source, D, E.
+The face and hair/cloth comparison crops (source, D, E) are not distributed: the source is a
+copyrighted cover. The notes below describe what they showed.
 
 Observed results:
 
@@ -34,5 +34,5 @@ fragment to test connected planes and locally broken edges before repeating smoo
 palm mass and bounded gaps to validate a hand before detailing its contour. Keep a successful face
 variant instead of repeatedly changing it to force a general improvement claim.
 
-Full evidence and authored MCP plans: engine repository `docs/experiments/2026-10-18-reference-e/`.
-Current experience journal: `docs/painting-experience.md` in that repository.
+Full evidence and authored MCP plans were kept privately for the same reason.
+Current experience journal: `docs/painting-experience.md` in the engine repository.
