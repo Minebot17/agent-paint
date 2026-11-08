@@ -400,11 +400,17 @@ def scenario_multi_doc():
             e.call("paint_strokes", strokes=[random_stroke(rng, w, h, size=20)], layer_id=top, document_id=doc)
     gc.collect(); total = memory()["private"] - start_mem
     raw = 10 * 12 * w * h * 4 / 2**20
+    out = {"documents": 10, "size": [w, h], "layers_each": 12, "calls_each": 40, "total_private_mb": round(total, 1),
+           "raw_layer_pixels_mb": round(raw, 1), "history_and_other_mb": round(total - raw, 1)}
+    if hasattr(e, "park_idle"):  # engines with idle-document parking: everything idle at once
+        start = time.perf_counter(); e.park_idle(idle_seconds=0); out["park_all_s"] = round(time.perf_counter() - start, 2)
+        gc.collect(); out["total_after_parking_mb"] = round(memory()["private"] - start_mem, 1)
+        start = time.perf_counter(); e.call("paint_document", action="info", document_id=docs[0])
+        e.call("paint_strokes", strokes=[random_stroke(random.Random(1), w, h)], document_id=docs[0])
+        out["first_call_after_parking_ms"] = ms(time.perf_counter() - start)
     for doc in docs: e.call("paint_document", action="close", document_id=doc, force=True)
-    gc.collect(); after_close = memory()["private"] - start_mem
-    return {"documents": 10, "size": [w, h], "layers_each": 12, "calls_each": 40, "total_private_mb": round(total, 1),
-            "raw_layer_pixels_mb": round(raw, 1), "history_and_other_mb": round(total - raw, 1),
-            "still_held_after_closing_all_mb": round(after_close, 1)}
+    gc.collect(); out["still_held_after_closing_all_mb"] = round(memory()["private"] - start_mem, 1)
+    return out
 
 
 def scenario_concurrency():

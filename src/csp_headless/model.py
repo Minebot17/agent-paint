@@ -1,14 +1,42 @@
 """Owned, editable scene state. No screenshot inference or native window handles."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import copy
+from io import BytesIO
 import math
+import os
 import secrets
 from PIL import Image, ImageChops
 
 MAX_PIXELS = 32_000_000
 HISTORY_COST = "__history_cost__"  # memoised size of a compacted history entry (not document state)
+HISTORY_SEQ = "__history_seq__"    # engine-wide age of a history entry, for the shared history budget
+HISTORY_KEYS = {HISTORY_COST, HISTORY_SEQ}
+
+
+class ParkedImage:
+    """Losslessly compressed pixels of an idle document. Only the size is readable: the engine
+    restores real pixels before any call works on the document, and any other access is a bug."""
+    __slots__ = ("data", "mode", "size")
+
+    def __init__(self, image):
+        buffer = BytesIO(); image.save(buffer, "PNG", compress_level=1)
+        self.data, self.mode, self.size = buffer.getvalue(), image.mode, image.size
+
+    @property
+    def width(self): return self.size[0]
+
+    @property
+    def height(self): return self.size[1]
+
+    def restore(self):
+        with Image.open(BytesIO(self.data)) as image:
+            return image.convert(self.mode) if image.mode != self.mode else image.copy()
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"pixels of a parked document were used ({name}); unpark it first")
 BLENDS = {"normal", "multiply", "screen", "overlay", "darken", "lighten", "add", "subtract", "difference", "soft_light"}
 
 
@@ -167,7 +195,7 @@ class Document:
         (they are never changed in place without own_pixels / reassignment)."""
         result = {}
         for key, value in state.items():
-            if key == HISTORY_COST: continue
+            if key in HISTORY_KEYS: continue
             if key == "layers": result[key] = [layer.clone() for layer in value]
             elif key == "selection": result[key] = value
             else: result[key] = copy.deepcopy(value)
@@ -247,6 +275,8 @@ class Document:
             return cached
         total = 1024
         for l in snapshot["layers"]:
+            # Every entry keeps a copy of all retained objects: a rough Python size, not pixels.
+            total += sum(400 + 140*len(o.get("points", ())) + 2*len(o.get("text", "")) for o in l.objects)
             if l.image is not None: total += l.image.width*l.image.height*4
             if l.mask is not None: total += l.mask.width*l.mask.height
             for record in l.__dict__.get("_history", {}).values():
@@ -258,13 +288,41 @@ class Document:
         return total
 
     def push(self, snapshot, memory_mb=128):
-        self.undo_stack.append(self.compact(snapshot))
+        self.push_compacted(self.compact(snapshot), memory_mb)
+
+    def push_compacted(self, entry, memory_mb=128):
+        self.undo_stack.append(entry)
         # Bound by approximate uncompressed image bytes, rather than arbitrary action count.
         budget = memory_mb*1024*1024
         total = sum(self._history_cost(s) for s in self.undo_stack)
         while len(self.undo_stack) > 1 and total > budget:
             total -= self._history_cost(self.undo_stack.pop(0))
         self.redo_stack.clear()
+
+    @property
+    def parked(self):
+        return any(isinstance(l.image, ParkedImage) for l in self.layers)
+
+    def park(self):
+        """Compress the pixels and masks of an idle document (lossless PNG, in parallel threads).
+        History entries keep their own pixels and stay valid: unpark() restores identical images."""
+        targets = [(l, name) for l in self.layers for name in ("image", "mask") if isinstance(getattr(l, name), Image.Image)]
+        if not targets:
+            return 0
+        with ThreadPoolExecutor(min(4, os.cpu_count() or 1, len(targets))) as pool:
+            parked = list(pool.map(lambda target: ParkedImage(getattr(*target)), targets))
+        for (layer, name), value in zip(targets, parked):
+            setattr(layer, name, value)
+        for layer in self.layers:
+            layer.__dict__.pop("_owned", None); layer.__dict__.pop("_written", None)
+        return sum(len(p.data) for p in parked)
+
+    def unpark(self):
+        for layer in self.layers:
+            for name in ("image", "mask"):
+                value = getattr(layer, name)
+                if isinstance(value, ParkedImage):
+                    setattr(layer, name, value.restore())
 
     def layers_info(self):
         return [{**l.info(objects=False), "index": i} for i, l in enumerate(list(self.layers))]
@@ -278,4 +336,5 @@ class Document:
                 "dirty": self.saved_revision != self.revision, "path": self.path,
                 "selection_bbox": selection.getbbox() if selection is not None else None,
                 "has_selection": selection is not None, "regions": copy.deepcopy(dict(self.regions)),
-                "view": copy.deepcopy(dict(self.view)), "undo": len(self.undo_stack), "redo": len(self.redo_stack)}
+                "view": copy.deepcopy(dict(self.view)), "undo": len(self.undo_stack), "redo": len(self.redo_stack),
+                "parked": self.parked}

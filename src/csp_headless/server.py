@@ -334,8 +334,10 @@ def main():
     parser.add_argument("--transport",choices=["stdio","http"],default="stdio")
     parser.add_argument("--host",default="127.0.0.1")
     parser.add_argument("--port",type=int,default=8765)
+    parser.add_argument("--history-mb",type=float,help="undo history of all documents together (default 512, env AGENT_PAINT_HISTORY_MB)")
+    parser.add_argument("--park-minutes",type=float,help="compress documents unused this long, 0 disables (default 15, env AGENT_PAINT_PARK_MINUTES)")
     args=parser.parse_args()
-    _engine=Engine(args.state_dir)
+    _engine=Engine(args.state_dir,history_mb=args.history_mb,park_minutes=args.park_minutes)
     if args.transport=="http":
         if args.host not in {"127.0.0.1","localhost","::1"}: parser.error("HTTP binds to loopback only; use a secure tunnel for remote access")
         mcp.settings.host=args.host; mcp.settings.port=args.port

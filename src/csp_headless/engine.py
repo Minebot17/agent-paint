@@ -13,12 +13,13 @@ import os
 from pathlib import Path
 import threading
 import time
+import weakref
 
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from . import __version__
-from .model import Document, Layer, BLENDS, dimensions, finite, uid
+from .model import Document, Layer, BLENDS, HISTORY_SEQ, dimensions, finite, uid
 from .render import (BRUSH_DEFAULTS, BRUSH_KINDS, FILTER_KINDS, PATTERN_DEFAULT_DENSITY, PATTERN_KINDS, RESAMPLING,
                      TEXT_ALIGNS, TEXT_ANCHORS, TEXT_STYLE_KEYS, TEXTURE_SPACES,
                      add_noise, apply_paint, blend, channel_shift, composite, composite_region, flood_region, font_for, fonts,
@@ -122,6 +123,18 @@ class StopSignal:
     def is_set(self): return self.abort.is_set() or self.cancel is not None and self.cancel.is_set()
 
 
+def _park_loop(engine_ref,closed,park_after):
+    """Background parker. Holds only a weak reference, so an engine nobody uses can be collected."""
+    interval=max(.05,min(60.0,park_after/4))
+    while not closed.wait(interval):
+        engine=engine_ref()
+        if engine is None: return
+        try: engine.park_idle()
+        except Exception as error:  # parking only saves memory: never let it stop the server
+            engine._audit(next(engine._events),"park_documents",{},time.monotonic(),"error",str(error))
+        del engine
+
+
 class _Idle:
     """Signal outside any call: never set."""
     @staticmethod
@@ -137,9 +150,19 @@ class Engine:
     document stay serialized. Engine-wide state (the document registry, the shared active document,
     brush presets) is guarded by the registry lock, always taken after a document lock, never before."""
 
-    def __init__(self,state_dir=None):
+    def __init__(self,state_dir=None,history_mb=None,park_minutes=None):
+        """history_mb caps the undo history of all documents together (each one also keeps at most
+        128 MB). park_minutes: documents unused that long are compressed in memory until next used
+        (0 disables). Defaults: AGENT_PAINT_HISTORY_MB=512, AGENT_PAINT_PARK_MINUTES=15."""
         self.state_dir=Path(state_dir or os.environ.get("AGENT_PAINT_STATE_DIR",Path.cwd()/".state")).resolve()
         self.state_dir.mkdir(parents=True,exist_ok=True)
+        setting=lambda value,name,default: float(os.environ.get(name,default) if value is None else value)
+        self.history_mb=setting(history_mb,"AGENT_PAINT_HISTORY_MB",512)
+        self.park_after=60*setting(park_minutes,"AGENT_PAINT_PARK_MINUTES",15)
+        self._history_lock=threading.Lock()  # every undo/redo stack change: the budget spans documents
+        self._history_seq=itertools.count(1)
+        self._last_used={}  # document id -> monotonic time its last call ended
+        self._parker=None; self._closed=threading.Event()
         self.documents={}
         self.active_document=None
         self.registry=threading.RLock()
@@ -221,6 +244,50 @@ class Engine:
         with self.registry:
             self._locks.setdefault(doc.id,threading.RLock())
             self.documents[doc.id]=doc; self.active_document=doc.id
+            self._last_used[doc.id]=time.monotonic()
+            if self.park_after>0 and self._parker is None:
+                self._parker=threading.Thread(target=_park_loop,args=(weakref.ref(self),self._closed,self.park_after),
+                                              name="agent-paint-parker",daemon=True)
+                self._parker.start()
+
+    # --- memory: shared history budget and idle documents --------------------------------------
+    def _push_history(self,doc,snapshot):
+        entry=doc.compact(snapshot); entry[HISTORY_SEQ]=next(self._history_seq); doc._history_cost(entry)
+        with self._history_lock:
+            doc.push_compacted(entry)
+            self._trim_history()
+
+    def _trim_history(self):
+        """Keep the undo/redo history of all documents within history_mb (call with the history lock).
+        The engine-wide oldest undo steps go first; every document keeps its latest step."""
+        budget=self.history_mb*1024*1024
+        documents=list(self.documents.values())
+        total=sum(Document._history_cost(e) for d in documents for e in d.undo_stack+d.redo_stack)
+        while total>budget:
+            candidates=[d for d in documents if len(d.undo_stack)>1]
+            if not candidates: break
+            oldest=min(candidates,key=lambda d: d.undo_stack[0].get(HISTORY_SEQ,0))
+            total-=Document._history_cost(oldest.undo_stack.pop(0))
+
+    def park_idle(self,idle_seconds=None):
+        """Compress documents not used for idle_seconds (default park_after); busy ones are skipped.
+        Their next call restores the pixels transparently. Returns the parked document ids."""
+        threshold=self.park_after if idle_seconds is None else idle_seconds
+        now=time.monotonic(); parked=[]
+        for doc in list(self.documents.values()):
+            if now-self._last_used.get(doc.id,now)<threshold: continue
+            lock=self._locks.get(doc.id)
+            if lock is None or not lock.acquire(blocking=False): continue
+            try:
+                if self.documents.get(doc.id) is doc and not doc.parked:
+                    started=time.monotonic(); size=doc.park(); parked.append(doc.id)
+                    self._audit(next(self._events),"park_document",{"document_id":doc.id,"compressed_bytes":size},started,"ok")
+            finally: lock.release()
+        return parked
+
+    def shutdown(self):
+        """Stop the background parker (the engine stays usable)."""
+        self._closed.set()
 
     def _document_lock(self,document_id):
         """Lock of an open document, or a no-op context when it is not open (the call then reports it)."""
@@ -259,10 +326,15 @@ class Engine:
             with self._signals_lock: self._signals.add(signal)
             local.busy,local.signal,local.doc_id,local.presets_changed=True,signal,target,False
             try:
+                doc=self.documents.get(target) if target is not None else None
+                if doc is not None and doc.parked and not (tool=="paint_state" or tool=="paint_document" and
+                                                             arguments.get("action","info") in {"info","close"}):
+                    doc.unpark()
                 return self._call_targeted(tool,arguments)
             finally:
                 local.busy,local.signal,local.doc_id=False,None,None
                 with self._signals_lock: self._signals.discard(signal)
+                if target is not None: self._last_used[target]=time.monotonic()
 
     def _call_targeted(self,tool,arguments):
         target=arguments.pop("document_id",None) if tool in DOCUMENT_SCOPED else None
@@ -293,7 +365,7 @@ class Engine:
                 if before is not None:
                     if self._signal.is_set(): raise InterruptedError("Operation aborted; transaction rolled back")
                     self.doc.revision+=1
-                    self.doc.push(before)
+                    self._push_history(self.doc,before)
                     target=result.info if isinstance(result,Picture) else result
                     target["revision"]=self.doc.revision
                 self._audit(event,tool,arguments,started,"ok")
@@ -337,7 +409,8 @@ class Engine:
                 "brush":copy.deepcopy(self.brush),"color":self.color,"brush_scope":"per document (pass document_id)",
                 "presets":list(self.presets),"concurrency":"calls on different documents run in parallel; calls on one document are serialized",
                 "operations":list(OPERATIONS),"project_format":".apaint v1",
-                "limits":{"max_pixels":32_000_000,"max_layers":128,"undo_memory_mb":128,
+                "limits":{"max_pixels":32_000_000,"max_layers":128,"undo_memory_mb":128,"server_undo_memory_mb":self.history_mb,
+                          "park_idle_documents_after_minutes":self.park_after/60,
                           "batch_inline_actions":INLINE_BATCH_LIMIT,"batch_file_actions":FILE_BATCH_LIMIT,
                           "strokes_per_call":1024},
                 "capabilities":{"pressure":True,"layer_masks":True,"clipping":True,"editable_text":True,
@@ -894,15 +967,18 @@ class Engine:
         if type(steps) is not int or not 1<=steps<=100: raise ValueError("steps must be 1..100")
         source=doc.undo_stack if action=="undo" else doc.redo_stack
         target=doc.redo_stack if action=="undo" else doc.undo_stack
-        if len(source)<steps: raise ValueError(f"Not enough history ({len(source)} {action} step(s) available); no changes applied")
-        for _ in range(steps):
+        with self._history_lock:  # the shared budget may trim stacks from another thread
+            if len(source)<steps: raise ValueError(f"Not enough history ({len(source)} {action} step(s) available); no changes applied")
+            entries=[source.pop() for _ in range(steps)]
+        for entry in entries:
             # Undo/redo restore the scene; the document's path, save state and current brush stay.
             path,saved_revision,revision,brush,color=doc.path,doc.saved_revision,doc.revision,doc.brush,doc.color
-            entry=source.pop()
             current=doc.snapshot()
             doc.restore(entry)
-            target.append(doc.compact(current))
+            moved=doc.compact(current); moved[HISTORY_SEQ]=next(self._history_seq); doc._history_cost(moved)
+            with self._history_lock: target.append(moved)
             doc.path,doc.saved_revision,doc.revision,doc.brush,doc.color=path,saved_revision,revision+1,brush,color
+        with self._history_lock: self._trim_history()
         return doc.info()
 
     def paint_batch(self,actions=None,expected_revision=None,actions_file=None,results="compact"):
