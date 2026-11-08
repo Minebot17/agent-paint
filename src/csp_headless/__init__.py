@@ -6,4 +6,4 @@ import os
 # thread is enough. This runs before any submodule imports numpy; an explicit setting still wins.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"

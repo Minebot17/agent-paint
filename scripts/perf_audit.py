@@ -7,6 +7,7 @@ Transient peaks are sampled by a background thread every ~0.5 ms (numpy/Pillow r
     python scripts/perf_audit.py                    # all scenarios, summary JSON to stdout
     python scripts/perf_audit.py --only overhead,flood --out audit.json
     python scripts/perf_audit.py --scenario flood   # one scenario in this process
+    python scripts/perf_audit.py --src other/checkout/src --only overhead   # measure another engine version
 """
 from __future__ import annotations
 
@@ -25,7 +26,9 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+# The engine under test: this checkout by default, or --src (e.g. an older commit in a git worktree).
+SRC = Path(sys.argv[sys.argv.index("--src") + 1]) if "--src" in sys.argv else ROOT / "src"
+sys.path.insert(0, str(SRC))
 
 
 # --- process memory --------------------------------------------------------------------------
@@ -487,7 +490,8 @@ SCENARIOS = {name[len("scenario_"):]: fn for name, fn in globals().items() if na
 def run_child(name, env_extra=None):
     env = {**os.environ, **(env_extra or {})}
     started = time.perf_counter()
-    proc = subprocess.run([sys.executable, __file__, "--scenario", name], capture_output=True, text=True, env=env, cwd=ROOT)
+    proc = subprocess.run([sys.executable, __file__, "--scenario", name, "--src", str(SRC)], capture_output=True, text=True,
+                          env=env, cwd=ROOT)
     if proc.returncode:
         return {"error": proc.stderr[-2000:]}
     return {"seconds": round(time.perf_counter() - started, 1), "result": json.loads(proc.stdout.strip().splitlines()[-1])}
@@ -498,6 +502,7 @@ def main():
     parser.add_argument("--scenario", choices=sorted(SCENARIOS))
     parser.add_argument("--only", help="comma-separated scenario names")
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--src", type=Path, help="engine sources to measure (default: this checkout)")
     args = parser.parse_args()
     if args.scenario:
         result = SCENARIOS[args.scenario]()
