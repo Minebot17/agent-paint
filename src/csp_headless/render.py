@@ -95,7 +95,7 @@ def apply_paint(layer, source, box, selection=None, erase=False, mode="normal"):
         result.putalpha(dest.getchannel("A"))
     else:
         result = blend(dest, source, mode)
-    own_pixels(layer)
+    own_pixels(layer, box)
     layer.image.paste(result, box[:2])
 
 
@@ -483,7 +483,7 @@ def smudge_stroke(layer,selection,samples,brush,stop=None):
             alpha=region[...,3:]
             straight=np.where(alpha>1e-6,region[...,:3]/np.maximum(alpha,1e-6),0)
             out=np.concatenate([straight,alpha],axis=2)
-            own_pixels(layer)
+            own_pixels(layer,clip)
             layer.image.paste(Image.fromarray(np.uint8(np.clip(out*255+.5,0,255)),"RGBA"),clip[:2])
         carry=carry*.75+current*.25
 

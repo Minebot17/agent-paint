@@ -418,7 +418,10 @@ class Engine:
         if action=="select": doc.active_layer=layer.id
         elif action=="duplicate":
             if len(doc.layers)>=128: raise ValueError("Maximum 128 layers")
-            layer=copy.deepcopy(layer); layer.id=uid(); layer.name=name or layer.name+" copy"
+            # clone() drops private copy-on-write/history bookkeeping that deepcopy would duplicate.
+            source=layer; layer=source.clone(); layer.image=source.image.copy()
+            layer.mask=source.mask.copy() if source.mask is not None else None
+            layer.id=uid(); layer.name=name or layer.name+" copy"
             doc.layers.insert(doc.layers.index(doc.layer(layer_id))+1,layer); doc.active_layer=layer.id
         elif action=="update": self._layer_properties(layer,properties or {})
         elif action=="reorder":

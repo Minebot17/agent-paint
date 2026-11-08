@@ -8,6 +8,7 @@ import secrets
 from PIL import Image, ImageChops
 
 MAX_PIXELS = 32_000_000
+HISTORY_COST = "__history_cost__"  # memoised size of a compacted history entry (not document state)
 BLENDS = {"normal", "multiply", "screen", "overlay", "darken", "lighten", "add", "subtract", "difference", "soft_light"}
 
 
@@ -51,6 +52,7 @@ class Layer:
         other = copy.copy(self)
         other.objects = copy.deepcopy(self.objects)
         other.__dict__.pop("_owned", None)
+        other.__dict__.pop("_written", None)
         other.__dict__.pop("_history", None)
         if "_history" in self.__dict__:
             other._history = dict(self._history)
@@ -69,15 +71,32 @@ class Layer:
         return data
 
 
-def own_pixels(layer):
-    """Copy-on-write guard: call before changing layer.image IN PLACE.
+def own_pixels(layer, box=None):
+    """Copy-on-write guard: call before changing layer.image IN PLACE inside box (l, t, r, b).
 
     Snapshots share layer pixels instead of copying them; the first in-place write after a
     snapshot works on a private copy, so the snapshot (rollback, undo) keeps the old pixels.
-    Code that assigns a new image to layer.image needs no guard."""
-    if not layer.__dict__.get("_owned"):
-        layer.image = layer.image.copy()
-        layer._owned = True
+    The written rectangles are accumulated, so history keeps just that patch of the old pixels
+    instead of comparing whole layers. Code that assigns a new image to layer.image needs no guard."""
+    state = layer.__dict__
+    if not state.get("_owned"):
+        source = layer.image
+        layer.image = source.copy()
+        state["_owned"] = True
+        # [shared original, private copy, union of written boxes]
+        state["_written"] = [source, layer.image, None]
+    written = state.get("_written")
+    if written is None or written[1] is not layer.image:
+        return  # the image was replaced after the copy: history falls back to comparing pixels
+    width, height = layer.image.size
+    if box is None:
+        box = (0, 0, width, height)
+    box = (max(0, int(box[0])), max(0, int(box[1])), min(width, int(box[2])), min(height, int(box[3])))
+    if box[0] >= box[2] or box[1] >= box[3]:
+        return
+    union = written[2]
+    written[2] = box if union is None else (min(union[0], box[0]), min(union[1], box[1]),
+                                            max(union[2], box[2]), max(union[3], box[3]))
 
 
 def _changed_box(a, b):
@@ -148,6 +167,7 @@ class Document:
         (they are never changed in place without own_pixels / reassignment)."""
         result = {}
         for key, value in state.items():
+            if key == HISTORY_COST: continue
             if key == "layers": result[key] = [layer.clone() for layer in value]
             elif key == "selection": result[key] = value
             else: result[key] = copy.deepcopy(value)
@@ -156,6 +176,7 @@ class Document:
     def snapshot(self):
         for layer in self.layers:
             layer.__dict__.pop("_owned", None)  # pixels are now shared with the snapshot
+            layer.__dict__.pop("_written", None)
         return self._copy_state({k: v for k, v in self.__dict__.items() if k not in {"undo_stack", "redo_stack"}})
 
     def restore(self, snapshot):
@@ -191,13 +212,21 @@ class Document:
             now = current.get(layer.id)
             if now is None or "_history" in layer.__dict__:
                 continue
+            written = now.__dict__.get("_written")
             history = {}
             for field_name in ("image", "mask"):
                 before, after = getattr(layer, field_name), getattr(now, field_name)
                 if before is None:
                     continue
                 # Copy-on-write makes untouched pixels the very same object: no comparison needed.
-                box = None if before is after else _changed_box(before, after)
+                if before is after:
+                    box = None
+                elif (field_name == "image" and written is not None and written[0] is before and written[1] is after
+                      and written[2] is not None):
+                    # Only in-place writes since the snapshot, all inside this rectangle.
+                    box = written[2]
+                else:
+                    box = _changed_box(before, after)
                 if box is None:
                     history[field_name] = "shared"
                 elif box is not False and (box[2]-box[0])*(box[3]-box[1]) < .6*before.width*before.height:
@@ -207,10 +236,15 @@ class Document:
                 setattr(layer, field_name, None)
             if history:
                 layer._history = history
+        for layer in self.layers:
+            layer.__dict__.pop("_written", None)  # the transaction is over: release the old pixels
         return snapshot
 
     @staticmethod
     def _history_cost(snapshot):
+        cached = snapshot.get(HISTORY_COST)
+        if cached is not None:
+            return cached
         total = 1024
         for l in snapshot["layers"]:
             if l.image is not None: total += l.image.width*l.image.height*4
@@ -220,6 +254,7 @@ class Document:
                     total += record[1].width*record[1].height*len(record[1].getbands())
         if snapshot.get("selection") is not None:
             total += snapshot["selection"].width*snapshot["selection"].height
+        snapshot[HISTORY_COST] = total  # entries are not changed after compaction
         return total
 
     def push(self, snapshot, memory_mb=128):
