@@ -111,6 +111,7 @@ def load_batch_file(path):
 class Picture:
     info: dict
     image: Image.Image
+    png: bytes | None = None  # encoded image when already available, so transports need not encode it again
 
 
 class StopSignal:
@@ -944,7 +945,8 @@ class Engine:
             if factor>1: image=image.resize((image.width*factor,image.height*factor),Image.Resampling.NEAREST)
             else: factor=1
         identifier=uid(); directory=self.state_dir/"snapshots"; directory.mkdir(exist_ok=True)
-        image_path=directory/(identifier+".png"); image.save(image_path)
+        # Encoded once: the same bytes go to the snapshot file, an optional path and the MCP response.
+        data=png(image); image_path=directory/(identifier+".png"); image_path.write_bytes(data)
         resolved_layer=doc.layer(layer_id).id if layer_id or source in {"layer","mask"} else None
         descriptor={"document_id":doc.id,"rectangle":list(box),"layer_id":resolved_layer,
                     "rotation":doc.view.get("rotation",0) if use_view else 0,"transparent":transparent,"source":source}
@@ -964,8 +966,8 @@ class Engine:
         (directory/(identifier+".json")).write_text(json.dumps(info,ensure_ascii=False,indent=2),"utf-8")
         self.snapshots[identifier]=info
         if path:
-            info["saved_path"]=atomic_write(path,lambda stream:stream.write(png(image)),overwrite=overwrite)
-        return Picture(info,image)
+            info["saved_path"]=atomic_write(path,lambda stream:stream.write(data),overwrite=overwrite)
+        return Picture(info,image,data)
 
     def paint_compare(self,reference_path,rectangle=None,reference_rectangle=None,max_side=1600):
         check_path(reference_path)

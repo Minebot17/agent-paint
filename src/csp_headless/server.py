@@ -117,8 +117,9 @@ async def execute(tool,**arguments):
     try:
         result=await asyncio.to_thread(engine().call,tool,_cancel_event=cancelled,**arguments)
         if isinstance(result,Picture):
+            data=result.png if result.png is not None else png(result.image)
             return CallToolResult(content=[TextContent(type="text",text=json.dumps(result.info,ensure_ascii=False)),
-                Image(data=png(result.image),format="png").to_image_content()],structuredContent=result.info)
+                Image(data=data,format="png").to_image_content()],structuredContent=result.info)
         return CallToolResult(content=[TextContent(type="text",text=json.dumps(result,ensure_ascii=False))],structuredContent=result)
     except asyncio.CancelledError:
         cancelled.set()

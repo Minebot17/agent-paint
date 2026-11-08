@@ -1,11 +1,13 @@
 """Versioned project archives and interoperable exports, written atomically."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import json
 import os
 from pathlib import Path
 import struct
+from types import SimpleNamespace
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
@@ -16,10 +18,40 @@ from .model import Document, Layer, BLENDS, dimensions, finite
 from .render import composite, rgba
 
 MIME = "application/x-agent-paint"
+PREVIEW_SIDE = 512
 
 
 def png(image):
     buffer = BytesIO(); image.save(buffer,"PNG"); return buffer.getvalue()
+
+
+def encode_pngs(images):
+    """PNG-encode several images in parallel threads (zlib releases the GIL); results keep order."""
+    images = list(images)
+    workers = min(8, os.cpu_count() or 1, len(images))
+    if workers <= 1:
+        return [png(image) for image in images]
+    with ThreadPoolExecutor(workers) as pool:
+        return list(pool.map(png, images))
+
+
+def preview_image(document, side=PREVIEW_SIDE):
+    """Composite thumbnail. Normal layers composite quickly, so the preview is exact as before; only a
+    large document with visible non-normal blend layers (float math per pixel) is composited from
+    layers box-reduced to about twice the preview size. A preview, never image data."""
+    width, height = document.size
+    factor = round(max(width, height)/(2*side))
+    if factor < 2 or not any(l.visible and l.blend != "normal" for l in document.layers):
+        preview = composite(document)
+    else:
+        layers = [SimpleNamespace(id=l.id, visible=l.visible, clipping=l.clipping, opacity=l.opacity, blend=l.blend,
+                                  image=l.image.reduce(factor) if l.visible else None,
+                                  mask=l.mask.reduce(factor) if l.visible and l.mask is not None else None)
+                  for l in document.layers]
+        size = next(l.image.size for l in layers if l.image is not None)
+        preview = composite(SimpleNamespace(size=size, background=document.background, layers=layers))
+    preview.thumbnail((side, side))
+    return preview
 
 
 def check_path(path):
@@ -62,21 +94,23 @@ def save_project(document, path, overwrite=True):
         metadata["brush"]=document.brush; metadata["color"]=document.color
     manifest = {"format":"agent-paint","version":1,"document":metadata,"layers":[]}
     def write(stream):
+        names, images = [], []
+        for layer in document.layers:
+            record = layer.info()
+            record["image"] = f"layers/{layer.id}.png"
+            names.append(record["image"]); images.append(layer.image)
+            if layer.mask is not None:
+                record["mask"] = f"masks/{layer.id}.png"
+                names.append(record["mask"]); images.append(layer.mask)
+            manifest["layers"].append(record)
+        if document.selection is not None:
+            manifest["selection"] = "selection.png"
+            names.append("selection.png"); images.append(document.selection)
+        names.append("preview.png"); images.append(preview_image(document))
         with zipfile.ZipFile(stream,"w",compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("mimetype",MIME,compress_type=zipfile.ZIP_STORED)
-            for layer in document.layers:
-                record = layer.info()
-                record["image"] = f"layers/{layer.id}.png"
-                archive.writestr(record["image"],png(layer.image))
-                if layer.mask is not None:
-                    record["mask"] = f"masks/{layer.id}.png"
-                    archive.writestr(record["mask"],png(layer.mask))
-                manifest["layers"].append(record)
-            if document.selection is not None:
-                manifest["selection"] = "selection.png"
-                archive.writestr("selection.png",png(document.selection))
-            preview = composite(document); preview.thumbnail((512,512))
-            archive.writestr("preview.png",png(preview))
+            for name, data in zip(names, encode_pngs(images)):
+                archive.writestr(name,data)
             archive.writestr("manifest.json",json.dumps(manifest,ensure_ascii=False,allow_nan=False))
     result = atomic_write(path,write,overwrite)
     document.path = result; document.saved_revision = document.revision
@@ -161,20 +195,29 @@ def effective_layers(document):
 def export_ora(document,stream):
     root = ET.Element("image",w=str(document.width),h=str(document.height),name=document.name,version="0.0.3")
     stack = ET.SubElement(root,"stack")
+    layers = list(reversed(list(effective_layers(document))))
+    for layer, _ in layers:
+        if layer.blend not in ORA_BLENDS: raise ValueError(f"ORA does not support {layer.blend}; use .apaint")
+    entries = []
+    for layer, image in layers:
+        src = f"data/{layer.id}.png"
+        entries.append((src, image))
+        ET.SubElement(stack,"layer",name=layer.name,src=src,x="0",y="0",opacity=str(layer.opacity),
+            visibility="visible" if layer.visible else "hidden", **{"composite-op":ORA_BLENDS[layer.blend]})
+    if document.background is not None:
+        entries.append(("data/background.png",Image.new("RGBA",document.size,rgba(document.background))))
+        ET.SubElement(stack,"layer",name="Paper",src="data/background.png",x="0",y="0",opacity="1.0",visibility="visible",**{"composite-op":"svg:src-over"})
+    merged = composite(document)  # once, for both the merged image and the thumbnail
+    thumb = merged.copy(); thumb.thumbnail((256,256))
+    entries += [("mergedimage.png",merged),("Thumbnails/thumbnail.png",thumb)]
+    encoded = dict(zip([name for name, _ in entries], encode_pngs(image for _, image in entries)))
     with zipfile.ZipFile(stream,"w",compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("mimetype","image/openraster",compress_type=zipfile.ZIP_STORED)
-        for layer,image in reversed(list(effective_layers(document))):
-            if layer.blend not in ORA_BLENDS: raise ValueError(f"ORA does not support {layer.blend}; use .apaint")
-            src = f"data/{layer.id}.png"
-            archive.writestr(src,png(image))
-            ET.SubElement(stack,"layer",name=layer.name,src=src,x="0",y="0",opacity=str(layer.opacity),
-                visibility="visible" if layer.visible else "hidden", **{"composite-op":ORA_BLENDS[layer.blend]})
-        if document.background is not None:
-            archive.writestr("data/background.png",png(Image.new("RGBA",document.size,rgba(document.background))))
-            ET.SubElement(stack,"layer",name="Paper",src="data/background.png",x="0",y="0",opacity="1.0",visibility="visible",**{"composite-op":"svg:src-over"})
+        for name, _ in entries[:-2]:
+            archive.writestr(name,encoded[name])
         archive.writestr("stack.xml",ET.tostring(root,encoding="utf-8",xml_declaration=True))
-        archive.writestr("mergedimage.png",png(composite(document)))
-        thumb = composite(document); thumb.thumbnail((256,256)); archive.writestr("Thumbnails/thumbnail.png",png(thumb))
+        for name in ("mergedimage.png","Thumbnails/thumbnail.png"):
+            archive.writestr(name,encoded[name])
 
 
 def import_ora(path):

@@ -319,3 +319,52 @@ def test_flood_region_matches_previous_algorithm():
             for tolerance in tolerances:
                 expected = reference_flood(image, x, y, tolerance)
                 assert flood_region(image, x, y, tolerance).tobytes() == expected.tobytes(), (image.size, x, y, tolerance)
+
+
+# --- 7. Snapshots and saving -------------------------------------------------------------------------
+
+def test_snapshot_encodes_png_once_for_file_path_and_transport(e, tmp_path):
+    import io
+    from pathlib import Path
+    e.call("paint_strokes", strokes=[{"points": [[10, 10], [300, 200]]}], brush={"size": 20}, layer_id="a")
+    picture = e.call("paint_snapshot", path=str(tmp_path / "copy.png"))
+    assert picture.png == Path(picture.info["image_path"]).read_bytes() == (tmp_path / "copy.png").read_bytes()
+    with Image.open(io.BytesIO(picture.png)) as decoded:
+        assert decoded.convert("RGBA").tobytes() == picture.image.tobytes()
+
+
+def test_project_entries_and_small_previews_are_unchanged(e, tmp_path):
+    import io, zipfile
+    from csp_headless.storage import encode_pngs, png
+    layered_document(e)
+    path = tmp_path / "p.apaint"
+    e.call("paint_document", action="save", path=str(path))
+    with zipfile.ZipFile(path) as archive:
+        entries = archive.infolist()
+        assert entries[0].filename == "mimetype" and entries[-1].filename == "manifest.json"
+        assert [i.filename for i in entries[1:4]] == [f"layers/{l.id}.png" for l in e.doc.layers[:3]]
+        expected = composite(e.doc); expected.thumbnail((512, 512))
+        with Image.open(io.BytesIO(archive.read("preview.png"))) as preview:
+            assert preview.convert("RGBA").tobytes() == expected.tobytes()
+    images = [layer.image for layer in e.doc.layers]
+    assert encode_pngs(images) == [png(image) for image in images]
+
+
+def test_large_document_preview_is_close_to_the_composite_thumbnail(tmp_path):
+    from csp_headless.storage import preview_image
+    big = Engine(tmp_path / "big")
+    big.call("paint_document", action="create", width=1800, height=1300, background="#EEDDCC")
+    rng = np.random.default_rng(4)
+    for i, mode in enumerate(["normal", "multiply", "screen", "normal"]):
+        lid = big.call("paint_layer", action="create", name=f"l{i}")["layer_id"]
+        big.call("paint_strokes", strokes=[{"points": [[float(rng.uniform(0, 1800)), float(rng.uniform(0, 1300))] for _ in range(5)],
+                                            "color": "#%06X" % int(rng.integers(1 << 24))} for _ in range(6)],
+                 brush={"size": 90}, layer_id=lid)
+        big.call("paint_layer", action="update", layer_id=lid, properties={"blend": mode})
+    expected = composite(big.doc); expected.thumbnail((512, 512))
+    preview = preview_image(big.doc)
+    assert preview.size == expected.size
+    assert np.abs(np.asarray(preview, dtype=int) - np.asarray(expected, dtype=int)).mean() < 2
+    for layer in big.doc.layers: layer.blend = "normal"  # normal layers composite cheaply: exact preview
+    expected = composite(big.doc); expected.thumbnail((512, 512))
+    assert preview_image(big.doc).tobytes() == expected.tobytes()

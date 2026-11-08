@@ -10,7 +10,7 @@ extraction is used when loading.
 | `layers/<layer-id>.png` | Full document-size RGBA pixels, straight alpha, cached for all layer kinds |
 | `masks/<layer-id>.png` | Optional document-size 8-bit grayscale mask |
 | `selection.png` | Optional document-size grayscale selection; absence means unrestricted |
-| `preview.png` | Composite thumbnail, at most 512×512 |
+| `preview.png` | Composite thumbnail, at most 512×512. Since engine 0.3.1 a document larger than about 1536 px with visible non-normal blend layers is composited from layers reduced to about 1024 px, so its preview is approximate; never use it as image data |
 
 `document`: stable document ID, name, `[width,height]`, DPI, optional paper/background CSS color,
 active layer ID, revision, named document regions; since engine 0.3 optionally the document's
