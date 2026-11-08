@@ -20,9 +20,9 @@ from .model import Document, Layer, BLENDS, dimensions, finite, uid
 from .render import (BRUSH_DEFAULTS, BRUSH_KINDS, FILTER_KINDS, PATTERN_DEFAULT_DENSITY, PATTERN_KINDS, RESAMPLING,
                      TEXT_ALIGNS, TEXT_ANCHORS, TEXT_STYLE_KEYS, TEXTURE_SPACES,
                      add_noise, apply_paint, blend, channel_shift, composite, composite_region, font_for, fonts, gaussian_blur,
-                     hard_polygon_mask, missing_glyphs, paint_stroke, paper_noise, pattern_coverage, relief,
-                     render_objects, rgba, shape_patch, smooth_outline, text_bounds, text_image, transformed,
-                     validate_brush, validate_dash, validate_gradient, validate_points)
+                     hard_polygon_mask, missing_glyphs, object_pixels, paint_stroke, paper_noise, pattern_coverage,
+                     relief, render_objects, rgba, shape_patch, smooth_outline, text_bounds, transformed,
+                     validate_affine, validate_brush, validate_dash, validate_gradient, validate_points)
 from .storage import atomic_write, check_path, export_image, import_ora, open_project, png, save_project
 
 # Tools that act on one document. They accept document_id to target it explicitly, so several
@@ -754,8 +754,9 @@ class Engine:
     def _object_bounds(self,obj):
         """Ink bounds of a text object in document pixels, including any retained transform."""
         if "transform" not in obj: return text_bounds(obj)
-        box=transformed(text_image(self.doc.size,obj),obj["transform"]).getchannel("A").getbbox()
-        return list(box) if box else None
+        placed=object_pixels(self.doc.size,obj)  # clipped to the canvas, like the rendered layer
+        box=placed[2].getchannel("A").getbbox() if placed else None
+        return [placed[0]+box[0],placed[1]+box[1],placed[0]+box[2],placed[1]+box[3]] if box else None
 
     def paint_object(self,action="list",object_id=None,layer_id=None,changes=None):
         layer=self.doc.layer(layer_id)
@@ -802,7 +803,9 @@ class Engine:
             layer.image=Image.alpha_composite(remainder,transformed(cut,matrix,resample=resample))
             doc.selection=transformed(doc.selection,matrix,resample=resample)
         else:
-            layer.image=transformed(layer.image,matrix,resample=resample)
+            # Vector/text pixels are re-rendered from their objects below, so they are not resampled.
+            if layer.kind=="raster": layer.image=transformed(layer.image,matrix,resample=resample)
+            else: validate_affine(matrix)
             if layer.mask is not None: layer.mask=transformed(layer.mask,matrix,resample=resample)
             if layer.kind!="raster":
                 def affine(m): return np.array([[m[0],m[1],m[2]],[m[3],m[4],m[5]],[0,0,1]],dtype=float)

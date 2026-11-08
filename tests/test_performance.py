@@ -196,3 +196,86 @@ def test_chunked_blend_is_bit_identical(mode, monkeypatch):
         assert render.blend(bottom, top, mode, opacity, m).tobytes() == reference_blend(bottom, top, mode, opacity, m).tobytes()
     empty = Image.new("RGBA", (120, 90))
     assert render.blend(bottom, empty, mode).tobytes() == reference_blend(bottom, empty, mode).tobytes()
+
+
+# --- 5. Retained objects rendered as patches ---------------------------------------------------------
+
+def reference_render_objects(layer):
+    """The previous implementation: a canvas-sized image (and transform) per object."""
+    from csp_headless import render
+    from csp_headless.model import Layer
+    size = layer.image.size
+    image = Image.new("RGBA", size)
+    for obj in layer.objects:
+        if obj["type"] == "text":
+            im = render.text_image(size, obj)
+        elif obj["type"] == "shape":
+            if "transform" not in obj:
+                box, patch = render.shape_patch(size, obj)
+                if box is not None: image.alpha_composite(patch, box[:2])
+                continue
+            im = render.shape_image(size, obj)
+        else:
+            temp = Layer("t", Image.new("RGBA", size))
+            render.paint_stroke(temp, None, obj["points"], obj["brush"], obj["color"], obj.get("closed", False),
+                                smooth=obj.get("smooth", False), dash=obj.get("dash"), dash_offset=obj.get("dash_offset", 0))
+            im = temp.image
+        if "transform" in obj: im = render.transformed(im, obj["transform"])
+        image = Image.alpha_composite(image, im)
+    return image
+
+
+def test_object_patches_match_canvas_sized_rendering(e):
+    import math
+    from csp_headless import render
+    vec = e.call("paint_layer", action="create", name="vec", kind="vector")["layer_id"]
+    e.call("paint_shape", shape="polygon", points=[[10, 10], [90, 20], [40, 80]], fill="#AA3366", outline="#112233", width=3, layer_id=vec)
+    e.call("paint_shape", shape="ellipse", points=[[250, 150], [330, 260]], fill="#33AA66", layer_id=vec)  # partly off-canvas
+    e.call("paint_shape", shape="bezier", points=[[5, 200], [100, 120], [200, 260], [300, 190]], outline="#000000", width=4, layer_id=vec)
+    e.call("paint_shape", shape="rectangle", points=[[100, 100], [140, 130]], fill="#2244FF", antialias=False, layer_id=vec)
+    e.call("paint_strokes", strokes=[{"points": [[20, 220, .2], [160, 160, 1], [300, 230, .1]], "smooth": True},
+                                     {"points": [[30, 30], [290, 40]], "dash": [10, 6]}], brush={"size": 9, "taper_end": .3}, layer_id=vec)
+    e.call("paint_strokes", strokes=[{"points": [[50, 120], [270, 120]]}], color="#CC880080",
+           brush={"size": 14, "blend": "multiply", "texture": .4, "seed": 3}, layer_id=vec)
+    e.call("paint_strokes", strokes=[{"points": [[60, 60], [200, 200]]}, {"points": [[60, 200], [200, 60]]}], brush={"size": 11}, layer_id=vec)
+    strokes = [o for o in e.doc.layer(vec).objects if o["type"] == "stroke"]
+    # Retained strokes may be switched to brushes that would need existing pixels.
+    e.call("paint_object", action="update", layer_id=vec, object_id=strokes[-2]["id"], changes={"brush": {"kind": "watercolor"}})
+    e.call("paint_object", action="update", layer_id=vec, object_id=strokes[-1]["id"], changes={"brush": {"kind": "eraser"}})
+    text = e.call("paint_text", text="Привет, мир\nline two", x=-20, y=170,
+                  style={"font_size": 28, "scale_x": 1.3, "rotation": 12, "outline_width": 2})["layer_id"]
+    e.call("paint_text", text="Angled", x=310, y=10, style={"font_size": 30, "anchor": "rt", "letter_spacing": 3}, layer_id=text)
+    matrices = [None, [math.cos(.3) * 1.4, -math.sin(.3), 60, math.sin(.3), math.cos(.3) * .8, -30],
+                [1, 0, -300, 0, 1, 0], [.25, .1, 200, -.05, .3, 120], [1, 0, 0, 0, 1, 0], [2.5, 0, -150, 0, 2.5, -200]]
+    white = Image.new("RGBA", e.doc.size, "white")
+    for matrix in matrices:
+        # Untransformed objects and whole-pixel moves are bit-identical. Fractional matrices offset the
+        # patch inside the resampling matrix, so a sampling coordinate may round differently: rare
+        # pixels differ by one premultiplied unit, invisible once composited.
+        exact = matrix is None or (matrix[0], matrix[1], matrix[3], matrix[4]) == (1, 0, 0, 1)
+        for lid in (vec, text):
+            layer = e.doc.layer(lid)
+            for obj in layer.objects:
+                obj.pop("transform", None)
+                if matrix: obj["transform"] = list(matrix)
+            expected = reference_render_objects(layer)
+            render.render_objects(layer)
+            if exact:
+                assert layer.image.tobytes() == expected.tobytes(), (lid, matrix)
+            else:
+                a = np.asarray(Image.alpha_composite(white, expected), dtype=int)
+                b = np.asarray(Image.alpha_composite(white, layer.image), dtype=int)
+                differing = np.abs(a - b).max(axis=2)
+                assert differing.max() <= 2 and (differing > 0).mean() < .005, (lid, matrix)
+        obj = e.doc.layer(text).objects[0]
+        if matrix:
+            old = render.transformed(render.text_image(e.doc.size, obj), obj["transform"]).getchannel("A").getbbox()
+            new = e._object_bounds(obj)
+            assert (old is None) == (new is None)
+            if old: assert max(abs(p - q) for p, q in zip(old, new)) <= (0 if exact else 1)
+
+
+def test_vector_transform_validates_matrix_without_objects(e):
+    e.call("paint_layer", action="create", name="empty", kind="vector")
+    with pytest.raises(ValueError, match="Singular"):
+        e.call("paint_transform", matrix=[0, 0, 0, 0, 0, 0], layer_id="empty")

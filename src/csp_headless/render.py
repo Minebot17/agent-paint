@@ -564,17 +564,31 @@ RESAMPLING = {"nearest": Image.Resampling.NEAREST, "bilinear": Image.Resampling.
               "bicubic": Image.Resampling.BICUBIC}
 
 
-def transformed(image, matrix, size=None, resample="bicubic"):
+def _check_affine(matrix):
     if len(matrix) != 6:
         raise ValueError("Affine matrix is [a,b,c,d,e,f]: x'=ax+by+c, y'=dx+ey+f")
     for v in matrix: finite(v, -1e7, 1e7)
-    if resample not in RESAMPLING:
-        raise ValueError("resample is nearest (pixel art, hard edges), bilinear or bicubic")
+
+
+def _invert_affine(matrix):
     a,b,c,d,e,f = matrix
     det = a*e-b*d
     if abs(det) < 1e-8:
         raise ValueError("Singular transform")
-    inverse = (e/det,-b/det,(b*f-e*c)/det,-d/det,a/det,(d*c-a*f)/det)
+    return (e/det,-b/det,(b*f-e*c)/det,-d/det,a/det,(d*c-a*f)/det)
+
+
+def validate_affine(matrix):
+    """Raise the same errors transformed() raises for an unusable matrix; returns its inverse."""
+    _check_affine(matrix)
+    return _invert_affine(matrix)
+
+
+def transformed(image, matrix, size=None, resample="bicubic"):
+    _check_affine(matrix)
+    if resample not in RESAMPLING:
+        raise ValueError("resample is nearest (pixel art, hard edges), bilinear or bicubic")
+    inverse = _invert_affine(matrix)
     if resample == "nearest":
         return image.transform(size or image.size, Image.Transform.AFFINE, inverse, Image.Resampling.NEAREST)
     # Premultiplied resampling: transparent (black) pixels must not darken the moved edge.
@@ -1120,25 +1134,83 @@ def pattern_coverage(kind, box, params):
     return image, count
 
 
+def stroke_patch(size, points, brush, color, closed=False, smooth=False, dash=None, dash_offset=0.0):
+    """A retained stroke rendered on its own: (box, RGBA patch) or None.
+
+    Equals painting it into an empty layer: erasing or smudging empty pixels leaves nothing, and a
+    watercolour wash finds no pigment to pick up, so it is plain colour."""
+    box, mask, _ = stroke_mask(size, points, brush, closed, smooth, dash, dash_offset)
+    if box is None or brush["kind"] in {"eraser", "smudge"}:
+        return None
+    colour = rgba(color)
+    mask = ImageChops.multiply(mask, Image.new("L", mask.size, colour[3]))
+    patch = Image.new("RGBA", mask.size, colour)
+    patch.putalpha(mask)
+    return box, patch
+
+
+def place_transformed(size, left, top, local, matrix):
+    """Transform a patch exactly as transforming a canvas-sized image holding it would (bicubic,
+    premultiplied), computing only the destination rectangle. Returns (left, top, image) or None."""
+    inverse = validate_affine(matrix)
+    width, height = size
+    # The canvas image holds only the part of the patch on the canvas. Pad it (inside the canvas) so
+    # resampling near its inner edges reads transparent pixels, as it would on the canvas.
+    cl, ct, cr, cb = max(0, left), max(0, top), min(width, left+local.width), min(height, top+local.height)
+    if cl >= cr or ct >= cb:
+        return None
+    pl, pt, pr, pb = max(0, cl-4), max(0, ct-4), min(width, cr+4), min(height, cb+4)
+    patch = Image.new("RGBA", (pr-pl, pb-pt))
+    patch.alpha_composite(local, (cl-pl, ct-pt), (cl-left, ct-top, cr-left, cb-top))
+    a, b, c, d, e, f = matrix
+    corners = [(a*x+b*y+c, d*x+e*y+f) for x, y in ((pl, pt), (pr, pt), (pl, pb), (pr, pb))]
+    dl = max(0, math.floor(min(x for x, _ in corners))-3); dt = max(0, math.floor(min(y for _, y in corners))-3)
+    dr = min(width, math.ceil(max(x for x, _ in corners))+3); db = min(height, math.ceil(max(y for _, y in corners))+3)
+    if dl >= dr or dt >= db:
+        return None
+    ia, ib, ic, id_, ie, if_ = inverse
+    shifted = (ia, ib, ia*dl+ib*dt+ic-pl, id_, ie, id_*dl+ie*dt+if_-pt)
+    moved = patch.convert("RGBa").transform((dr-dl, db-dt), Image.Transform.AFFINE, shifted, Image.Resampling.BICUBIC)
+    return dl, dt, moved.convert("RGBA")
+
+
+def object_pixels(size, obj):
+    """One retained object as (left, top, RGBA image) in document pixels with its transform applied,
+    or None when it leaves no pixels. Untransformed text may extend past the canvas."""
+    if "transform" in obj:
+        validate_affine(obj["transform"])
+    kind = obj["type"]
+    if kind == "text":
+        left, top, local = text_patch(obj)
+    elif kind == "shape":
+        box, local = shape_patch(size, obj)
+        if box is None:
+            return None
+        left, top = box[:2]
+    elif kind == "stroke":
+        placed = stroke_patch(size, obj["points"], obj["brush"], obj["color"], obj.get("closed", False),
+                              obj.get("smooth", False), obj.get("dash"), obj.get("dash_offset", 0))
+        if placed is None:
+            return None
+        (left, top, _, _), local = placed
+    else:
+        raise ValueError("Unknown editable object type")
+    if "transform" in obj:
+        return place_transformed(size, left, top, local, obj["transform"])
+    return left, top, local
+
+
 def render_objects(layer):
+    """Rebuild a vector/text layer from its objects. Each object is drawn as a patch over its own
+    bounds; nothing allocates or transforms a canvas-sized image per object."""
     size = layer.image.size
     layer.image = Image.new("RGBA",size)
     for obj in layer.objects:
-        if obj["type"] == "text": im = text_image(size,obj)
-        elif obj["type"] == "shape":
-            if "transform" not in obj:
-                box, patch = shape_patch(size,obj)
-                if box is not None:
-                    layer.image.alpha_composite(patch,box[:2])
-                continue
-            im = shape_image(size,obj)
-        elif obj["type"] == "stroke":
-            from .model import Layer
-            temp = Layer("vector stroke",Image.new("RGBA",size))
-            paint_stroke(temp,None,obj["points"],obj["brush"],obj["color"],obj.get("closed",False),
-                         smooth=obj.get("smooth",False),dash=obj.get("dash"),dash_offset=obj.get("dash_offset",0))
-            im = temp.image
-        else: raise ValueError("Unknown editable object type")
-        if "transform" in obj:
-            im = transformed(im,obj["transform"])
-        layer.image = Image.alpha_composite(layer.image,im)
+        placed = object_pixels(size, obj)
+        if placed is None:
+            continue
+        left, top, image = placed
+        # alpha_composite rejects negative destinations, so skip what lies left of/above the canvas.
+        sx, sy = max(0, -left), max(0, -top)
+        if sx < image.width and sy < image.height:
+            layer.image.alpha_composite(image, (left+sx, top+sy), (sx, sy))
