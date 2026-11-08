@@ -165,3 +165,34 @@ def test_snapshot_and_sample_composite_only_what_they_need(e, monkeypatch):
         samples = e.call("paint_sample", points=points)["samples"]
         assert [tuple(s["rgba"]) for s in samples] == [full.getpixel(tuple(p)) for p in points]
     assert boxes and None not in boxes
+
+
+# --- 4. Blend modes in chunks within the covered rectangle -------------------------------------------
+
+def reference_blend(bottom, top, mode, opacity=1.0, mask=None):
+    """The previous whole-image implementation."""
+    from PIL import ImageChops
+    from csp_headless import render
+    if mask is not None or opacity != 1:
+        top = top.copy(); alpha = top.getchannel("A")
+        if mask is not None: alpha = ImageChops.multiply(alpha, mask)
+        if opacity != 1: alpha = alpha.point(lambda a: round(a * opacity))
+        top.putalpha(alpha)
+    if mode == "normal": return Image.alpha_composite(bottom, top)
+    return render._blend_pixels(bottom, top, mode)
+
+
+@pytest.mark.parametrize("mode", sorted(model.BLENDS))
+def test_chunked_blend_is_bit_identical(mode, monkeypatch):
+    from csp_headless import render
+    monkeypatch.setattr(render, "BLEND_CHUNK_PIXELS", 700)  # many small chunks
+    rng = np.random.default_rng(11)
+    bottom = rng.integers(0, 256, (90, 120, 4), dtype=np.uint8)
+    bottom[::7, ::5, 3] = 0  # transparent pixels that still store RGB
+    top = np.zeros((90, 120, 4), np.uint8); top[20:70, 30:100] = rng.integers(0, 256, (50, 70, 4), dtype=np.uint8)
+    bottom, top = Image.fromarray(bottom), Image.fromarray(top)
+    mask = Image.fromarray(rng.integers(0, 256, (90, 120), dtype=np.uint8))
+    for opacity, m in ((1, None), (.55, None), (1, mask), (.3, mask)):
+        assert render.blend(bottom, top, mode, opacity, m).tobytes() == reference_blend(bottom, top, mode, opacity, m).tobytes()
+    empty = Image.new("RGBA", (120, 90))
+    assert render.blend(bottom, empty, mode).tobytes() == reference_blend(bottom, empty, mode).tobytes()

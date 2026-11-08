@@ -21,6 +21,10 @@ def rgba(color):
         raise ValueError(f"Invalid color: {color!r}") from error
 
 
+# Pixels per float32 chunk of a separable blend (about 50 MB of temporaries per chunk).
+BLEND_CHUNK_PIXELS = 1 << 19
+
+
 def blend(bottom, top, mode="normal", opacity=1.0, mask=None):
     if mode not in BLENDS:
         raise ValueError(f"Unsupported blend mode {mode}")
@@ -35,6 +39,26 @@ def blend(bottom, top, mode="normal", opacity=1.0, mask=None):
         top.putalpha(alpha)
     if mode == "normal":
         return Image.alpha_composite(bottom, top)
+    # The formula changes only pixels the top covers. Elsewhere it returns the backdrop, except that
+    # fully transparent pixels come out as (0,0,0,0). Keep both exact while computing just the
+    # covered rectangle, in row chunks that bound the float32 temporaries.
+    out = bottom.copy()
+    alpha = out.getchannel("A")
+    if alpha.getextrema()[0] == 0:
+        out = Image.composite(out, Image.new("RGBA", out.size), alpha.point(lambda a: 255 if a else 0))
+    box = top.getchannel("A").getbbox()
+    if box is None:
+        return out
+    left, upper, right, lower = box
+    rows = max(1, BLEND_CHUNK_PIXELS // (right-left))
+    for y in range(upper, lower, rows):
+        chunk = (left, y, right, min(lower, y+rows))
+        out.paste(_blend_pixels(bottom.crop(chunk), top.crop(chunk), mode), chunk[:2])
+    return out
+
+
+def _blend_pixels(bottom, top, mode):
+    """Separable blend of two equally sized RGBA images in float32 (W3C compositing formulas)."""
     b = np.asarray(bottom, dtype=np.float32)/255
     s = np.asarray(top, dtype=np.float32)/255
     cb, cs, ba, sa = b[..., :3], s[..., :3], b[..., 3:], s[..., 3:]
