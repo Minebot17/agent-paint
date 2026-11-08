@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clip-stuido-headless"
+version = "0.3.0"
+description = "A synchronous, desktop-free layered painting engine for agents with CSP MCP compatibility"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.30,<2", "Pillow>=11,<13", "numpy>=2,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "psd-tools>=1.10,<2"]
+
+[project.scripts]
+csp-headless = "csp_headless.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/csp_headless"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

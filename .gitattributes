@@ -1,0 +1,5 @@
+# Keep LF in the working tree: the same checkout also runs under WSL/Linux.
+* text=auto eol=lf
+*.png binary
+*.apaint binary
+*.ttf binary

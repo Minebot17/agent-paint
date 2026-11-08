@@ -1,0 +1,6 @@
+interface:
+  display_name: "Agent Paint"
+  short_description: "Оригинальные работы в любом стиле и рисование по референсу в фоне через Agent Paint"
+  default_prompt: "Используй $agent-paint-reference, чтобы нарисовать работу в Agent Paint (оригинальную в заданном стиле или по референсу) и проверить итог по снимкам."
+policy:
+  allow_implicit_invocation: true

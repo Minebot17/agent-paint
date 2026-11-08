@@ -1,0 +1,12 @@
+.venv/
+.venv-wsl/
+.venv-*/
+__pycache__/
+.pytest_cache/
+.state/
+.state-*/
+*.egg-info/
+artifacts/
+dist/
+
+paintings/

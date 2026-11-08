@@ -1,0 +1,4 @@
+{"tool":"paint_document","arguments":{"action":"create","width":512,"height":512,"name":"First headless painting","background":"#F1E7D1"}}
+{"tool":"paint_brush","arguments":{"action":"configure","color":"#236D70","settings":{"size":35,"taper_end":0.25}}}
+{"tool":"paint_strokes","arguments":{"strokes":[{"points":[[80,300,0.1],[190,180,0.7],[330,260,1],[430,170,0.05]]}]}}
+{"tool":"paint_snapshot","arguments":{"label":"First pressure stroke"}}
