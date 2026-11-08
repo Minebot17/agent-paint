@@ -19,7 +19,7 @@ from . import __version__
 from .model import Document, Layer, BLENDS, dimensions, finite, uid
 from .render import (BRUSH_DEFAULTS, BRUSH_KINDS, FILTER_KINDS, PATTERN_DEFAULT_DENSITY, PATTERN_KINDS, RESAMPLING,
                      TEXT_ALIGNS, TEXT_ANCHORS, TEXT_STYLE_KEYS, TEXTURE_SPACES,
-                     add_noise, apply_paint, blend, channel_shift, composite, font_for, fonts, gaussian_blur,
+                     add_noise, apply_paint, blend, channel_shift, composite, composite_region, font_for, fonts, gaussian_blur,
                      hard_polygon_mask, missing_glyphs, paint_stroke, paper_noise, pattern_coverage, relief,
                      render_objects, rgba, shape_patch, smooth_outline, text_bounds, text_image, transformed,
                      validate_brush, validate_dash, validate_gradient, validate_points)
@@ -926,18 +926,19 @@ class Engine:
         if rectangle is not None: box=self._rectangle(rectangle)
         elif use_view: box=tuple(doc.view.get("rectangle",[0,0,*doc.size]))
         else: box=(0,0,*doc.size)
+        crop=tuple(map(round,box))
         if source=="selection":
             if doc.selection is None: raise ValueError("No selection")
-            rendered=doc.selection.convert("RGBA")
+            image=doc.selection.convert("RGBA").crop(crop)
         elif source=="mask":
             mask=doc.layer(layer_id).mask
             if mask is None: raise ValueError("Layer has no mask")
-            rendered=mask.convert("RGBA")
+            image=mask.convert("RGBA").crop(crop)
         elif source=="layer" or source=="composite" and layer_id:
-            rendered=doc.layer(layer_id).image.copy()
-        elif source=="composite": rendered=composite(doc,transparent)
+            image=doc.layer(layer_id).image.crop(crop)
+        # Only the requested rectangle is composited: a detail of a large painting stays cheap.
+        elif source=="composite": image=composite_region(doc,crop,transparent)
         else: raise ValueError("source must be composite, layer, selection or mask")
-        image=rendered.crop(tuple(map(round,box)))
         if use_view and doc.view.get("rotation"): image=image.rotate(-doc.view["rotation"],Image.Resampling.BICUBIC,expand=True)
         image.thumbnail((max_side,max_side),Image.Resampling.LANCZOS)
         factor=1
@@ -972,8 +973,7 @@ class Engine:
 
     def paint_compare(self,reference_path,rectangle=None,reference_rectangle=None,max_side=1600):
         check_path(reference_path)
-        source=composite(self.doc)
-        if rectangle is not None: source=source.crop(self._rectangle(rectangle))
+        source=composite_region(self.doc,self._rectangle(rectangle)) if rectangle is not None else composite(self.doc)
         with Image.open(reference_path) as reference:
             dimensions(*reference.size)
             reference=reference.convert("RGBA")
@@ -992,14 +992,26 @@ class Engine:
         return Picture({"reference":"left","painting":"right","analysis_only":True,"reference_imported":False},image)
 
     def paint_sample(self,points,sample_merged=True,layer_id=None):
-        source=composite(self.doc) if sample_merged and layer_id is None else self.doc.layer(layer_id).image
-        result=[]
+        doc=self.doc; located=[]
         for point in points:
             if len(point)!=2: raise ValueError("Sample points use [x,y]")
             x,y=map(round,point)
-            if not 0<=x<self.doc.width or not 0<=y<self.doc.height: raise ValueError("Sample outside document")
-            value=source.getpixel((x,y)); result.append({"point":[x,y],"rgba":value,"hex":"#"+"".join(f"{v:02X}" for v in value)})
-        return {"samples":result}
+            if not 0<=x<doc.width or not 0<=y<doc.height: raise ValueError("Sample outside document")
+            located.append((x,y))
+        if sample_merged and layer_id is None:
+            # Composite only the sampled pixels (or their bounding box for many points), not the canvas.
+            if len(located)<=64:
+                values=[composite(doc,box=(x,y,x+1,y+1)).getpixel((0,0)) for x,y in located]
+            elif located:
+                l,t=min(x for x,_ in located),min(y for _,y in located)
+                region=composite(doc,box=(l,t,max(x for x,_ in located)+1,max(y for _,y in located)+1))
+                values=[region.getpixel((x-l,y-t)) for x,y in located]
+            else: values=[]
+        else:
+            source=doc.layer(layer_id).image
+            values=[source.getpixel(p) for p in located]
+        return {"samples":[{"point":[x,y],"rgba":value,"hex":"#"+"".join(f"{v:02X}" for v in value)}
+                           for (x,y),value in zip(located,values)]}
 
     def paint_fonts(self,query="",supports=None):
         """List fonts; supports=<text> keeps only fonts that have a glyph for every visible character."""

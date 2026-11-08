@@ -54,26 +54,51 @@ def blend(bottom, top, mode="normal", opacity=1.0, mask=None):
     return Image.fromarray(np.uint8(np.clip(np.concatenate([rgb, alpha], axis=2)*255+.5, 0, 255)))
 
 
-def composite(document, transparent=False, through=None):
+def composite(document, transparent=False, through=None, box=None):
+    """Flatten the visible layers. box=(left, top, right, bottom) inside the canvas renders only that
+    rectangle; its pixels equal the same crop of the full composite."""
+    if box is None:
+        size, view = document.size, (lambda image: image)
+    else:
+        box = tuple(int(v) for v in box)
+        size, view = (box[2]-box[0], box[3]-box[1]), (lambda image: image.crop(box))
     color = (0, 0, 0, 0) if transparent or document.background is None else rgba(document.background)
-    out = Image.new("RGBA", document.size, color)
-    base_alpha = Image.new("L", document.size)
+    out = Image.new("RGBA", size, color)
+    base_alpha = Image.new("L", size)
     for layer in document.layers:
         if not layer.visible:
             if not layer.clipping:
-                base_alpha = Image.new("L", document.size)
+                base_alpha = Image.new("L", size)
             continue
-        mask = layer.mask
-        effective = layer.image.getchannel("A")
+        image = view(layer.image)
+        mask = view(layer.mask) if layer.mask is not None else None
+        effective = image.getchannel("A")
         if mask is not None:
             effective = ImageChops.multiply(effective, mask)
         if layer.clipping:
             mask = ImageChops.multiply(mask, base_alpha) if mask is not None else base_alpha
         else:
             base_alpha = effective.point(lambda a: round(a*layer.opacity))
-        out = blend(out, layer.image, layer.blend, layer.opacity, mask)
+        out = blend(out, image, layer.blend, layer.opacity, mask)
         if through and layer.id == through:
             break
+    return out
+
+
+def composite_region(document, box, transparent=False):
+    """Composite of an integer rectangle that may extend past the canvas: the outside is transparent,
+    exactly like cropping the full composite, but only the requested pixels are computed."""
+    left, top, right, bottom = (int(v) for v in box)
+    width, height = document.size
+    inner = (max(0, left), max(0, top), min(width, right), min(height, bottom))
+    if inner[0] >= inner[2] or inner[1] >= inner[3]:
+        return Image.new("RGBA", (right-left, bottom-top))
+    whole = inner == (0, 0, width, height)
+    part = composite(document, transparent) if whole else composite(document, transparent, box=inner)
+    if inner == (left, top, right, bottom):
+        return part
+    out = Image.new("RGBA", (right-left, bottom-top))
+    out.paste(part, (inner[0]-left, inner[1]-top))
     return out
 
 

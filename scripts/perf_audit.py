@@ -118,6 +118,8 @@ def engine_with_profile():
     profile.wrap(engine_module.Engine, "_audit")
     profile.wrap(render, "own_pixels")
     profile.wrap(engine_module, "composite")
+    if hasattr(engine_module, "composite_region"):  # region compositing (snapshots of a rectangle)
+        profile.wrap(engine_module, "composite_region", "composite")
     state = tempfile.mkdtemp(prefix="apaint-audit-")
     return engine_module.Engine(state), profile, state
 
