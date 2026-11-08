@@ -267,13 +267,15 @@ class Document:
         self.redo_stack.clear()
 
     def layers_info(self):
-        return [{**l.info(objects=False), "index": i} for i, l in enumerate(self.layers)]
+        return [{**l.info(objects=False), "index": i} for i, l in enumerate(list(self.layers))]
 
     def info(self):
+        # Containers are copied atomically first: listing documents does not wait for their calls.
+        selection = self.selection
         return {"document_id": self.id, "name": self.name, "size": list(self.size), "dpi": self.dpi,
                 "background": self.background, "active_layer": self.active_layer,
                 "layers": self.layers_info(), "layer_order": "bottom-to-top", "revision": self.revision,
                 "dirty": self.saved_revision != self.revision, "path": self.path,
-                "selection_bbox": self.selection.getbbox() if self.selection is not None else None,
-                "has_selection": self.selection is not None, "regions": copy.deepcopy(self.regions),
-                "view": copy.deepcopy(self.view), "undo": len(self.undo_stack), "redo": len(self.redo_stack)}
+                "selection_bbox": selection.getbbox() if selection is not None else None,
+                "has_selection": selection is not None, "regions": copy.deepcopy(dict(self.regions)),
+                "view": copy.deepcopy(dict(self.view)), "undo": len(self.undo_stack), "redo": len(self.redo_stack)}

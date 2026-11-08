@@ -1,10 +1,12 @@
 """Synchronous application API. All state is owned here, never in an OS desktop."""
 from __future__ import annotations
 
+import contextlib
 import copy
 from dataclasses import dataclass
 from io import BytesIO
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -115,23 +117,40 @@ class Picture:
 
 
 class StopSignal:
-    def __init__(self,abort,cancel=None): self.abort,self.cancel=abort,cancel
+    """Abort flag of one top-level call (paint_abort sets every active one) plus its MCP cancellation."""
+    def __init__(self,abort=None,cancel=None): self.abort,self.cancel=abort or threading.Event(),cancel
     def is_set(self): return self.abort.is_set() or self.cancel is not None and self.cancel.is_set()
 
 
+class _Idle:
+    """Signal outside any call: never set."""
+    @staticmethod
+    def is_set(): return False
+
+
+IDLE=_Idle()
+
+
 class Engine:
+    """Documents are independent: a call holds only its document's lock, so agents painting different
+    documents run in parallel (Pillow and numpy release the GIL in heavy work), while calls on one
+    document stay serialized. Engine-wide state (the document registry, the shared active document,
+    brush presets) is guarded by the registry lock, always taken after a document lock, never before."""
+
     def __init__(self,state_dir=None):
         self.state_dir=Path(state_dir or os.environ.get("AGENT_PAINT_STATE_DIR",Path.cwd()/".state")).resolve()
         self.state_dir.mkdir(parents=True,exist_ok=True)
         self.documents={}
         self.active_document=None
-        self.lock=threading.RLock()
-        self.stop=threading.Event()
-        self._signal=StopSignal(self.stop)
+        self.registry=threading.RLock()
+        self._locks={}  # document id -> lock serializing calls on that document
+        self._local=threading.local()  # per-call state: document, stop signal, batch depth, audit buffer
+        self._signals=set(); self._signals_lock=threading.Lock()
+        self._audit_lock=threading.Lock()
+        self._events=itertools.count(1)
         # Brush/colour used before any document exists; every document then owns its own copy.
         self._default_brush=validate_brush({})
         self._default_color="#000000"
-        self._audit_buffer=None
         self.presets={
             "ink":validate_brush({"size":8,"taper_end":.15}),
             "pencil":validate_brush({"kind":"pencil","size":5,"opacity":.8}),
@@ -143,36 +162,54 @@ class Engine:
             "eraser":validate_brush({"kind":"eraser","size":20}),
             "smudge":validate_brush({"kind":"smudge","size":30,"hardness":.5})}
         self.snapshots={}
-        self._batch_depth=0
-        self._event=0
+
+    # --- per-call state (thread-local: concurrent calls never see each other's) -------------------
+    @property
+    def _signal(self): return self._local.__dict__.get("signal") or IDLE
+
+    @property
+    def _batch_depth(self): return self._local.__dict__.get("batch_depth",0)
+
+    @_batch_depth.setter
+    def _batch_depth(self,value): self._local.batch_depth=value
+
+    @property
+    def _audit_buffer(self): return self._local.__dict__.get("audit_buffer")
+
+    @_audit_buffer.setter
+    def _audit_buffer(self,value): self._local.audit_buffer=value
+
+    def _target(self):
+        """Document id of the current call (resolved when it started), else the shared active one."""
+        return self._local.__dict__.get("doc_id") or self.active_document
 
     @property
     def doc(self):
-        if self.active_document not in self.documents:
-            raise ValueError("No active document. Create or open one with paint_document")
-        return self.documents[self.active_document]
+        doc=self.documents.get(self._target())
+        if doc is None: raise ValueError("No active document. Create or open one with paint_document")
+        return doc
 
     # The current brush and colour belong to the targeted document, so agents sharing a server
     # cannot change each other's tool state. Without any document they are engine defaults.
     @property
     def brush(self):
-        doc=self.documents.get(self.active_document)
+        doc=self.documents.get(self._target())
         return doc.brush if doc is not None else self._default_brush
 
     @brush.setter
     def brush(self,value):
-        doc=self.documents.get(self.active_document)
+        doc=self.documents.get(self._target())
         if doc is not None: doc.brush=value
         else: self._default_brush=value
 
     @property
     def color(self):
-        doc=self.documents.get(self.active_document)
+        doc=self.documents.get(self._target())
         return doc.color if doc is not None else self._default_color
 
     @color.setter
     def color(self,value):
-        doc=self.documents.get(self.active_document)
+        doc=self.documents.get(self._target())
         if doc is not None: doc.color=value
         else: self._default_color=value
 
@@ -181,40 +218,66 @@ class Engine:
         if not doc.brush:
             doc.brush=copy.deepcopy(brush if brush is not None else self.brush)
             doc.color=color if color is not None else self.color
-        self.documents[doc.id]=doc; self.active_document=doc.id
+        with self.registry:
+            self._locks.setdefault(doc.id,threading.RLock())
+            self.documents[doc.id]=doc; self.active_document=doc.id
+
+    def _document_lock(self,document_id):
+        """Lock of an open document, or a no-op context when it is not open (the call then reports it)."""
+        return self._locks.get(document_id) or contextlib.nullcontext()
+
+    def _resolve(self,tool,arguments):
+        """(lock, document id) for a top-level call. Calls on one document serialize on its lock;
+        registry actions use the registry lock; opening and listing manage locks themselves."""
+        action=arguments.get("action","info") if tool=="paint_document" else None
+        if tool in DOCUMENT_SCOPED or tool=="paint_state" or action in {"info","save","export","close"}:
+            target=arguments.get("document_id") or self.active_document
+            lock=self._locks.get(target)
+            if lock is not None: return lock,target
+            return self.registry,None  # unknown or no document: the call itself raises the usual error
+        if tool=="paint_fonts" or action in {"open","import_image","import_ora","list"}:
+            return contextlib.nullcontext(),None
+        return self.registry,None
 
     def call(self,tool,_cancel_event=None,**arguments):
         if tool not in OPERATIONS:
             raise ValueError(f"Unknown operation {tool}")
-        # Abort never waits for the drawing lock.
+        # Abort never waits for a lock: every operation running right now stops and rolls back.
         if tool=="paint_abort":
-            self.stop.set(); return {"abort_requested":True}
-        with self.lock:
-            previous=self._signal
-            if _cancel_event is not None:
-                if _cancel_event.is_set(): raise InterruptedError("Request cancelled before execution")
-                self._signal=StopSignal(self.stop,_cancel_event)
+            with self._signals_lock:
+                for signal in self._signals: signal.abort.set()
+            return {"abort_requested":True}
+        local=self._local
+        if local.__dict__.get("busy"):  # an action inside paint_batch: same thread, its document is locked
+            return self._call_targeted(tool,arguments)
+        lock,target=self._resolve(tool,arguments)
+        with lock:
+            if target is not None and self._locks.get(target) is not lock:
+                raise ValueError(f"Document {target!r} was closed while this call was waiting")
+            if _cancel_event is not None and _cancel_event.is_set(): raise InterruptedError("Request cancelled before execution")
+            signal=StopSignal(cancel=_cancel_event)
+            with self._signals_lock: self._signals.add(signal)
+            local.busy,local.signal,local.doc_id,local.presets_changed=True,signal,target,False
             try:
                 return self._call_targeted(tool,arguments)
             finally:
-                self._signal=previous
+                local.busy,local.signal,local.doc_id=False,None,None
+                with self._signals_lock: self._signals.discard(signal)
 
     def _call_targeted(self,tool,arguments):
         target=arguments.pop("document_id",None) if tool in DOCUMENT_SCOPED else None
         if target is None: return self._call_locked(tool,arguments)
         if target not in self.documents: raise ValueError(f"Unknown document_id {target!r}; see paint_document(action='list')")
-        if self._batch_depth and target!=self.active_document:
+        local=self._local
+        if self._batch_depth and target!=local.__dict__.get("doc_id"):
             raise ValueError("Actions inside a batch use the batch's document; pass document_id to paint_batch")
-        # Calls serialize on the engine lock, so switching the active document for one call is race-free.
-        previous=self.active_document; self.active_document=target
+        previous=local.__dict__.get("doc_id"); local.doc_id=target
         try: return self._call_locked(tool,arguments)
-        finally:
-            if previous in self.documents: self.active_document=previous
+        finally: local.doc_id=previous
 
     def _call_locked(self,tool,arguments):
             started=time.monotonic()
-            self._event+=1
-            event=self._event
+            event=next(self._events)
             before=None
             context=None
             scene_tool=tool in SCENE_TOOLS
@@ -223,8 +286,8 @@ class Engine:
             scene_tool |= tool=="paint_region" and arguments.get("action","define")!="get"
             if scene_tool and not self._batch_depth:
                 before=self.doc.snapshot()
-                context=(copy.deepcopy(self.brush),self.color,copy.deepcopy(self.presets))
-                self.stop.clear()
+                with self.registry: presets=copy.deepcopy(self.presets)
+                context=(copy.deepcopy(self.brush),self.color,presets)
             try:
                 result=getattr(self,tool)(**arguments)
                 if before is not None:
@@ -238,7 +301,10 @@ class Engine:
             except BaseException as error:
                 if before is not None:
                     self.doc.restore(before)
-                    self.brush,self.color,self.presets=context
+                    self.brush,self.color=context[:2]
+                    # Presets are shared: restore them only if this call changed them.
+                    if self._local.__dict__.get("presets_changed"):
+                        with self.registry: self.presets=context[2]
                 self._audit(event,tool,arguments,started,"error",str(error))
                 raise
 
@@ -249,27 +315,27 @@ class Engine:
         limit=2000 if nested else 16000
         record={"event":event,"tool":tool,"status":status,"elapsed_ms":round((time.monotonic()-started)*1000,3),
                 "arguments":arguments if len(encoded)<limit else {"sha256":hashlib.sha256(encoded.encode()).hexdigest(),"characters":len(encoded)},
-                "document_id":self.active_document,"error":error}
+                "document_id":self._target(),"error":error}
         if nested: record["in_batch"]=True
         line=json.dumps(record,ensure_ascii=False,default=str)+"\n"
         if nested and self._audit_buffer is not None:
             self._audit_buffer.append(line); return
-        with (self.state_dir/"actions.jsonl").open("a",encoding="utf-8") as stream:
+        with self._audit_lock, (self.state_dir/"actions.jsonl").open("a",encoding="utf-8") as stream:
             stream.write(line)
 
     def _flush_audit(self):
         if self._audit_buffer:
-            with (self.state_dir/"actions.jsonl").open("a",encoding="utf-8") as stream:
+            with self._audit_lock, (self.state_dir/"actions.jsonl").open("a",encoding="utf-8") as stream:
                 stream.writelines(self._audit_buffer)
         self._audit_buffer=None
 
     def paint_state(self):
         return {"engine":"Agent Paint","version":__version__,"headless":True,"uses_desktop":False,
                 "coordinates":"document pixels; pressure 0..1; opacity 0..1",
-                "documents":[{"id":d.id,"name":d.name,"size":list(d.size),"dirty":d.revision!=d.saved_revision} for d in self.documents.values()],
-                "active_document":self.active_document,"document":self.doc.info() if self.active_document else None,
+                "documents":[{"id":d.id,"name":d.name,"size":list(d.size),"dirty":d.revision!=d.saved_revision} for d in list(self.documents.values())],
+                "active_document":self.active_document,"document":self.doc.info() if self._target() in self.documents else None,
                 "brush":copy.deepcopy(self.brush),"color":self.color,"brush_scope":"per document (pass document_id)",
-                "presets":list(self.presets),
+                "presets":list(self.presets),"concurrency":"calls on different documents run in parallel; calls on one document are serialized",
                 "operations":list(OPERATIONS),"project_format":".apaint v1",
                 "limits":{"max_pixels":32_000_000,"max_layers":128,"undo_memory_mb":128,
                           "batch_inline_actions":INLINE_BATCH_LIMIT,"batch_file_actions":FILE_BATCH_LIMIT,
@@ -291,9 +357,9 @@ class Engine:
                        background="#FFFFFF",dpi=144,path=None,overwrite=False,transparent=False,force=False,scale=1):
         if document_id is not None and action in {"info","save","export"}:
             if document_id not in self.documents: raise ValueError("Unknown document_id")
-            previous=self.active_document; self.active_document=document_id
+            local=self._local; previous=local.__dict__.get("doc_id"); local.doc_id=document_id
             try: return self.paint_document(action,None,width,height,name,background,dpi,path,overwrite,transparent,force,scale)
-            finally: self.active_document=previous
+            finally: local.doc_id=previous
         if action=="create":
             width,height=dimensions(width,height)
             if background is not None: rgba(background)
@@ -323,34 +389,20 @@ class Engine:
                     dimensions(*source.size)
                     doc=Document(*source.size,name=name if name!="Untitled" else Path(path).stem,background=None)
                     doc.layer().image=source.convert("RGBA")
-            existing=self.documents.get(doc.id)
-            if existing is not None:
-                same=existing.path is not None and Path(existing.path).resolve()==Path(path).expanduser().resolve()
-                if same and existing.revision!=existing.saved_revision and not force:
-                    raise ValueError(f"This project is already open (document_id {existing.id}) with unsaved changes. "
-                                     "Save it, select it, or pass force=true to discard them and reload from disk")
-                if same and not force:
-                    # Re-opening the file that is already open simply selects it.
-                    self.active_document=existing.id
-                    return {**existing.info(),"already_open":True}
-                if same:
-                    self._adopt(doc,existing.brush,existing.color)
-                    return {**doc.info(),"reloaded_from_disk":True}
-                # Another file of the same document (e.g. a saved variant): open it as a separate document.
-                original=doc.id; doc.id=uid()
-                self._adopt(doc)
-                return {**doc.info(),"document_id_changed_from":original,
-                        "note":"Another saved copy of this document is already open, so this one received a new document_id"}
-            self._adopt(doc)
+            # An open document with this id may be in use: wait for its calls, then change the registry.
+            with self._document_lock(doc.id), self.registry:
+                return self._adopt_opened(doc,path,force)
         elif action=="select":
             if document_id not in self.documents: raise ValueError("Unknown document_id")
             self.active_document=document_id
         elif action=="close":
-            doc=self.documents.get(document_id or self.active_document)
+            doc=self.documents.get(document_id or self._target())
             if doc is None: raise ValueError("Unknown document_id")
             if doc.revision!=doc.saved_revision and not force: raise ValueError("Document has unsaved changes; save or use force=true")
-            del self.documents[doc.id]
-            if self.active_document==doc.id: self.active_document=next(iter(self.documents),None)
+            with self.registry:  # this document's lock is held, so no call on it is running
+                if self.documents.get(doc.id) is doc:
+                    del self.documents[doc.id]; self._locks.pop(doc.id,None)
+                if self.active_document==doc.id: self.active_document=next(iter(self.documents),None)
             return {"closed":doc.id,"active_document":self.active_document}
         elif action=="save":
             destination=path or self.doc.path
@@ -372,8 +424,31 @@ class Engine:
                                 "Save it with paint_document(action='save', path='....apaint')." if doc.path else
                                 "Export wrote only the image; save the editable project with paint_document(action='save', path='....apaint').")
             return result
-        elif action=="list": return {"documents":[d.info() for d in self.documents.values()]}
+        elif action=="list": return {"documents":[d.info() for d in list(self.documents.values())]}
         elif action!="info": raise ValueError("Unknown document action")
+        return self.doc.info()
+
+    def _adopt_opened(self,doc,path,force):
+        """Register an opened/imported document, reconciling it with an open document of the same id."""
+        existing=self.documents.get(doc.id)
+        if existing is not None:
+            same=existing.path is not None and Path(existing.path).resolve()==Path(path).expanduser().resolve()
+            if same and existing.revision!=existing.saved_revision and not force:
+                raise ValueError(f"This project is already open (document_id {existing.id}) with unsaved changes. "
+                                 "Save it, select it, or pass force=true to discard them and reload from disk")
+            if same and not force:
+                # Re-opening the file that is already open simply selects it.
+                self.active_document=existing.id
+                return {**existing.info(),"already_open":True}
+            if same:
+                self._adopt(doc,existing.brush,existing.color)
+                return {**doc.info(),"reloaded_from_disk":True}
+            # Another file of the same document (e.g. a saved variant): open it as a separate document.
+            original=doc.id; doc.id=uid()
+            self._adopt(doc)
+            return {**doc.info(),"document_id_changed_from":original,
+                    "note":"Another saved copy of this document is already open, so this one received a new document_id"}
+        self._adopt(doc)
         return self.doc.info()
 
     @staticmethod
@@ -484,9 +559,10 @@ class Engine:
         for key,value in props.items(): setattr(layer,key,value)
 
     def paint_brush(self,action="get",settings=None,color=None,name=None,path=None,overwrite=False):
-        scope=self.active_document if self.active_document in self.documents else "default"
+        scope=self._target() if self._target() in self.documents else "default"
         if action=="get": return {"settings":copy.deepcopy(self.brush),"color":self.color,"brush_of":scope}
-        if action=="list": return {"presets":copy.deepcopy(self.presets),"kinds":sorted(BRUSH_KINDS)}
+        if action=="list":
+            with self.registry: return {"presets":copy.deepcopy(self.presets),"kinds":sorted(BRUSH_KINDS)}
         if action=="configure":
             brush=validate_brush({**self.brush,**(settings or {})})
             if color is not None: rgba(color)
@@ -494,23 +570,26 @@ class Engine:
             if color is not None: self.color=color
         elif action=="save_preset":
             if not name: raise ValueError("name is required")
-            self.presets[name]=copy.deepcopy(self.brush)
+            with self.registry: self.presets[name]=copy.deepcopy(self.brush); self._local.presets_changed=True
         elif action=="load_preset":
-            if name not in self.presets: raise ValueError("Unknown preset")
-            self.brush=copy.deepcopy(self.presets[name])
+            with self.registry:
+                if name not in self.presets: raise ValueError("Unknown preset")
+                brush=copy.deepcopy(self.presets[name])
+            self.brush=brush
         elif action=="delete_preset":
-            if name not in self.presets: raise ValueError("Unknown preset")
-            del self.presets[name]
+            with self.registry:
+                if name not in self.presets: raise ValueError("Unknown preset")
+                del self.presets[name]; self._local.presets_changed=True
         elif action=="export_presets":
             if not path: raise ValueError("path required")
-            data=json.dumps({"format":"agent-paint-brushes","version":1,"presets":self.presets},indent=2).encode()
+            with self.registry: data=json.dumps({"format":"agent-paint-brushes","version":1,"presets":self.presets},indent=2).encode()
             return {"path":atomic_write(path,lambda s:s.write(data),overwrite)}
         elif action=="import_presets":
             if not path: raise ValueError("path required")
             data=json.loads(Path(path).read_text("utf-8"))
             if data.get("format")!="agent-paint-brushes" or data.get("version")!=1: raise ValueError("Not a brush library")
             presets={k:validate_brush(v) for k,v in data["presets"].items()}
-            self.presets.update(presets)
+            with self.registry: self.presets.update(presets); self._local.presets_changed=True
         else: raise ValueError("Unknown brush action")
         return {"settings":copy.deepcopy(self.brush),"color":self.color,"presets":list(self.presets),"brush_of":scope}
 
@@ -845,7 +924,7 @@ class Engine:
                                  "(no filesystem actions or nested batches)")
             arguments=item.get("arguments",{})
             if not isinstance(arguments,dict): raise ValueError(f"Batch action {index}: arguments must be an object")
-            if arguments.get("document_id") not in {None,self.active_document}:
+            if arguments.get("document_id") not in {None,self._target()}:
                 raise ValueError("A batch edits one document; pass document_id to paint_batch, not to its actions")
             if item["tool"]=="paint_brush" and arguments.get("action") in {"import_presets","export_presets"}:
                 raise ValueError("Filesystem actions are not permitted inside a batch")

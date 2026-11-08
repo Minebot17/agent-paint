@@ -21,7 +21,8 @@ document pixels (strokes may opt into normalized 0..1). Pressure and opacity are
 No window, foreground app, pointer, OCR, UI binding, calibration, duration or sleep is involved.
 
 START: paint_document(action='create',width=...,height=...) returns document_id. Several agents may
-share one server: pass document_id on EVERY call. Each document owns its brush and colour
+share one server: pass document_id on EVERY call. Different documents are painted in parallel; calls
+on one document run one at a time. Each document owns its brush and colour
 (paint_brush with document_id), so nobody else can change your brush; a new document starts from
 a copy of the active document's brush.
 
