@@ -67,10 +67,11 @@ def test_small_stroke_on_big_layer_keeps_a_small_patch(tmp_path):
     e = Engine(tmp_path / "state")
     e.call("paint_document", action="create", width=2000, height=2000)
     e.call("paint_strokes", strokes=[{"points": [[1000, 1000], [1040, 1010]]}], brush={"size": 8})
-    record = e.doc.undo_stack[-1]["layers"][0]._history["image"]
-    box, patch = record
-    assert patch.width * patch.height < .001 * 2000 * 2000
-    assert box[0] <= 1000 - 4 and box[2] >= 1040 + 4
+    kind, tiles = e.doc.undo_stack[-1]["layers"][0]._history["image"]
+    # Tiled layers: history keeps the previous version of just the tiles the stroke touched
+    # (here: none existed, the layer was empty there).
+    assert kind == "tiles" and 1 <= len(tiles) <= 4
+    assert sum(t.width * t.height for t in tiles.values() if t is not None) < .02 * 2000 * 2000
 
 
 def test_mixed_in_place_and_replacing_writes_in_one_batch(e):
@@ -219,7 +220,7 @@ def reference_render_objects(layer):
             temp = Layer("t", Image.new("RGBA", size))
             render.paint_stroke(temp, None, obj["points"], obj["brush"], obj["color"], obj.get("closed", False),
                                 smooth=obj.get("smooth", False), dash=obj.get("dash"), dash_offset=obj.get("dash_offset", 0))
-            im = temp.image
+            im = temp.image.to_image()
         if "transform" in obj: im = render.transformed(im, obj["transform"])
         image = Image.alpha_composite(image, im)
     return image
@@ -264,7 +265,7 @@ def test_object_patches_match_canvas_sized_rendering(e):
                 assert layer.image.tobytes() == expected.tobytes(), (lid, matrix)
             else:
                 a = np.asarray(Image.alpha_composite(white, expected), dtype=int)
-                b = np.asarray(Image.alpha_composite(white, layer.image), dtype=int)
+                b = np.asarray(Image.alpha_composite(white, layer.image.to_image()), dtype=int)
                 differing = np.abs(a - b).max(axis=2)
                 assert differing.max() <= 2 and (differing > 0).mean() < .005, (lid, matrix)
         obj = e.doc.layer(text).objects[0]

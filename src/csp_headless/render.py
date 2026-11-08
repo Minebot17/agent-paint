@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFilter, ImageFont
 
 from .model import BLENDS, finite, own_pixels
+from .tiles import TILE, TiledImage
 
 
 def rgba(color):
@@ -25,6 +26,12 @@ def rgba(color):
 BLEND_CHUNK_PIXELS = 1 << 19
 
 
+@lru_cache(maxsize=256)
+def _opacity_lut(opacity):
+    """The table Image.point(lambda a: round(a*opacity)) builds, computed once per opacity."""
+    return [round(a*opacity) for a in range(256)]
+
+
 def blend(bottom, top, mode="normal", opacity=1.0, mask=None):
     if mode not in BLENDS:
         raise ValueError(f"Unsupported blend mode {mode}")
@@ -35,7 +42,7 @@ def blend(bottom, top, mode="normal", opacity=1.0, mask=None):
         if mask is not None:
             alpha = ImageChops.multiply(alpha, mask)
         if opacity != 1:
-            alpha = alpha.point(lambda a: round(a*opacity))
+            alpha = alpha.point(_opacity_lut(opacity))
         top.putalpha(alpha)
     if mode == "normal":
         return Image.alpha_composite(bottom, top)
@@ -80,21 +87,50 @@ def _blend_pixels(bottom, top, mode):
 
 def composite(document, transparent=False, through=None, box=None):
     """Flatten the visible layers. box=(left, top, right, bottom) inside the canvas renders only that
-    rectangle; its pixels equal the same crop of the full composite."""
+    rectangle; its pixels equal the same crop of the full composite. Tiled layers are composited
+    tile by tile, and the empty tiles of a layer cost nothing."""
+    if box is None and any(isinstance(layer.image, TiledImage) for layer in document.layers):
+        width, height = document.size
+        out = Image.new("RGBA", document.size)
+        for top in range(0, height, TILE):
+            for left in range(0, width, TILE):
+                tile_box = (left, top, min(width, left+TILE), min(height, top+TILE))
+                out.paste(_composite(document, transparent, through, tile_box, aligned=True), tile_box[:2])
+        return out
+    return _composite(document, transparent, through, box)
+
+
+def _composite(document, transparent, through, box, aligned=False):
     if box is None:
-        size, view = document.size, (lambda image: image)
+        size = document.size
+        def view(image): return image
     else:
         box = tuple(int(v) for v in box)
-        size, view = (box[2]-box[0], box[3]-box[1]), (lambda image: image.crop(box))
+        size, key = (box[2]-box[0], box[3]-box[1]), (box[0]//TILE, box[1]//TILE)
+        def view(image):
+            if isinstance(image, TiledImage):
+                if aligned:
+                    return image.tile(key)  # read-only, never changed below; None when empty
+                return None if image.is_empty(box) else image.crop(box)
+            return image.crop(box)
     color = (0, 0, 0, 0) if transparent or document.background is None else rgba(document.background)
     out = Image.new("RGBA", size, color)
-    base_alpha = Image.new("L", size)
+    empty_alpha = base_alpha = Image.new("L", size)
+    clear = None
     for layer in document.layers:
         if not layer.visible:
             if not layer.clipping:
-                base_alpha = Image.new("L", size)
+                base_alpha = empty_alpha
             continue
         image = view(layer.image)
+        if image is None:  # nothing painted here: a normal layer leaves the result unchanged
+            if not layer.clipping:
+                base_alpha = empty_alpha
+            if layer.blend == "normal":
+                if through and layer.id == through:
+                    break
+                continue
+            image = clear = clear or Image.new("RGBA", size)
         mask = view(layer.mask) if layer.mask is not None else None
         effective = image.getchannel("A")
         if mask is not None:
@@ -102,7 +138,7 @@ def composite(document, transparent=False, through=None, box=None):
         if layer.clipping:
             mask = ImageChops.multiply(mask, base_alpha) if mask is not None else base_alpha
         else:
-            base_alpha = effective.point(lambda a: round(a*layer.opacity))
+            base_alpha = effective.point(_opacity_lut(layer.opacity))
         out = blend(out, image, layer.blend, layer.opacity, mask)
         if through and layer.id == through:
             break
@@ -1260,7 +1296,7 @@ def render_objects(layer):
     """Rebuild a vector/text layer from its objects. Each object is drawn as a patch over its own
     bounds; nothing allocates or transforms a canvas-sized image per object."""
     size = layer.image.size
-    layer.image = Image.new("RGBA",size)
+    layer.image = TiledImage(size)
     for obj in layer.objects:
         placed = object_pixels(size, obj)
         if placed is None:

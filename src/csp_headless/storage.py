@@ -16,12 +16,14 @@ from PIL import Image
 
 from .model import Document, Layer, BLENDS, dimensions, finite
 from .render import composite, rgba
+from .tiles import TiledImage
 
 MIME = "application/x-agent-paint"
 PREVIEW_SIDE = 512
 
 
 def png(image):
+    if isinstance(image, TiledImage): image = image.to_image()
     buffer = BytesIO(); image.save(buffer,"PNG"); return buffer.getvalue()
 
 
@@ -45,7 +47,7 @@ def preview_image(document, side=PREVIEW_SIDE):
         preview = composite(document)
     else:
         layers = [SimpleNamespace(id=l.id, visible=l.visible, clipping=l.clipping, opacity=l.opacity, blend=l.blend,
-                                  image=l.image.reduce(factor) if l.visible else None,
+                                  image=l.image.to_image().reduce(factor) if l.visible else None,
                                   mask=l.mask.reduce(factor) if l.visible and l.mask is not None else None)
                   for l in document.layers]
         size = next(l.image.size for l in layers if l.image is not None)
@@ -183,7 +185,7 @@ def effective_layers(document):
     from PIL import ImageChops
     base = Image.new("L",document.size)
     for layer in document.layers:
-        image = layer.image.copy()
+        image = layer.image.to_image()
         alpha = image.getchannel("A")
         if layer.mask is not None: alpha = ImageChops.multiply(alpha,layer.mask)
         if layer.clipping: alpha = ImageChops.multiply(alpha,base)

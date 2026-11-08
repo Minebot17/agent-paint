@@ -10,6 +10,8 @@ import os
 import secrets
 from PIL import Image, ImageChops
 
+from .tiles import TiledImage
+
 MAX_PIXELS = 32_000_000
 HISTORY_COST = "__history_cost__"  # memoised size of a compacted history entry (not document state)
 HISTORY_SEQ = "__history_seq__"    # engine-wide age of a history entry, for the shared history budget
@@ -22,8 +24,9 @@ class ParkedImage:
     __slots__ = ("data", "mode", "size")
 
     def __init__(self, image):
-        buffer = BytesIO(); image.save(buffer, "PNG", compress_level=1)
-        self.data, self.mode, self.size = buffer.getvalue(), image.mode, image.size
+        pixels = image.to_image() if isinstance(image, TiledImage) else image
+        buffer = BytesIO(); pixels.save(buffer, "PNG", compress_level=1)
+        self.data, self.mode, self.size = buffer.getvalue(), pixels.mode, pixels.size
 
     @property
     def width(self): return self.size[0]
@@ -62,8 +65,10 @@ def dimensions(width, height):
 
 @dataclass
 class Layer:
+    """A layer's pixels are a TiledImage: assigning a Pillow image converts it, so empty areas take
+    no memory and history shares unchanged tiles. Masks stay ordinary 8-bit images."""
     name: str
-    image: Image.Image
+    image: TiledImage
     id: str = field(default_factory=uid)
     opacity: float = 1.0
     blend: str = "normal"
@@ -74,6 +79,11 @@ class Layer:
     mask: Image.Image | None = None
     kind: str = "raster"
     objects: list[dict] = field(default_factory=list)
+
+    def __setattr__(self, name, value):
+        if name == "image" and isinstance(value, Image.Image):
+            value = TiledImage.from_image(value)
+        object.__setattr__(self, name, value)
 
     def clone(self):
         """Independent layer record sharing the (copy-on-write) pixels."""
@@ -162,7 +172,7 @@ class Document:
     def __post_init__(self):
         dimensions(self.width, self.height)
         if not self.layers:
-            self.layers = [Layer("Layer 1", Image.new("RGBA", self.size))]
+            self.layers = [Layer("Layer 1", TiledImage(self.size))]
             self.active_layer = self.layers[0].id
         if not self.view:
             self.view = {"rectangle": [0, 0, self.width, self.height], "rotation": 0}
@@ -224,6 +234,10 @@ class Document:
                 record = history.get(field_name)
                 if record == "shared":
                     setattr(layer, field_name, getattr(source, field_name))
+                elif record is not None and record[0] == "tiles":
+                    restored = getattr(source, field_name).copy()  # shares tiles; puts back the old ones
+                    restored.set_tiles(record[1])
+                    setattr(layer, field_name, restored)
                 elif record is not None:
                     box, patch = record
                     restored = getattr(source, field_name).copy()
@@ -236,6 +250,9 @@ class Document:
         therefore keep many undo steps. Undo is stack-ordered, so the current state at restore time
         always equals the state this entry was compacted against."""
         current = {l.id: l for l in self.layers}
+        for layer in self.layers:
+            if isinstance(layer.image, TiledImage):
+                layer.image.trim()  # tiles erased to all-zero take no memory
         for layer in snapshot["layers"]:
             now = current.get(layer.id)
             if now is None or "_history" in layer.__dict__:
@@ -245,6 +262,12 @@ class Document:
             for field_name in ("image", "mask"):
                 before, after = getattr(layer, field_name), getattr(now, field_name)
                 if before is None:
+                    continue
+                if before is not after and isinstance(before, TiledImage) and isinstance(after, TiledImage):
+                    # Copy-on-write tiles: what changed is exactly the tiles that are new objects.
+                    changed = before.changed_tiles(after)
+                    history[field_name] = ("tiles", changed) if changed else "shared"
+                    setattr(layer, field_name, None)
                     continue
                 # Copy-on-write makes untouched pixels the very same object: no comparison needed.
                 if before is after:
@@ -277,10 +300,15 @@ class Document:
         for l in snapshot["layers"]:
             # Every entry keeps a copy of all retained objects: a rough Python size, not pixels.
             total += sum(400 + 140*len(o.get("points", ())) + 2*len(o.get("text", "")) for o in l.objects)
-            if l.image is not None: total += l.image.width*l.image.height*4
+            if l.image is not None:
+                total += l.image.nbytes if isinstance(l.image, TiledImage) else l.image.width*l.image.height*4
             if l.mask is not None: total += l.mask.width*l.mask.height
             for record in l.__dict__.get("_history", {}).values():
-                if record != "shared":
+                if record == "shared":
+                    continue
+                if record[0] == "tiles":
+                    total += sum(t.width*t.height*4 for t in record[1].values() if t is not None)
+                else:
                     total += record[1].width*record[1].height*len(record[1].getbands())
         if snapshot.get("selection") is not None:
             total += snapshot["selection"].width*snapshot["selection"].height
@@ -306,7 +334,8 @@ class Document:
     def park(self):
         """Compress the pixels and masks of an idle document (lossless PNG, in parallel threads).
         History entries keep their own pixels and stay valid: unpark() restores identical images."""
-        targets = [(l, name) for l in self.layers for name in ("image", "mask") if isinstance(getattr(l, name), Image.Image)]
+        targets = [(l, name) for l in self.layers for name in ("image", "mask")
+                   if isinstance(getattr(l, name), (Image.Image, TiledImage))]
         if not targets:
             return 0
         with ThreadPoolExecutor(min(4, os.cpu_count() or 1, len(targets))) as pool:

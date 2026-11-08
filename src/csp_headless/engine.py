@@ -28,6 +28,7 @@ from .render import (BRUSH_DEFAULTS, BRUSH_KINDS, FILTER_KINDS, PATTERN_DEFAULT_
                      relief, render_objects, rgba, shape_patch, smooth_outline, text_bounds, transformed,
                      validate_affine, validate_brush, validate_dash, validate_gradient, validate_points)
 from .storage import atomic_write, check_path, export_image, import_ora, open_project, png, save_project
+from .tiles import TiledImage
 
 # Tools that act on one document. They accept document_id to target it explicitly, so several
 # agents sharing one server never draw into each other's active document.
@@ -553,7 +554,7 @@ class Engine:
             if len(doc.layers)>=128: raise ValueError("Maximum 128 layers")
             if action=="create":
                 if kind not in {"raster","vector","text"}: raise ValueError("Layer kind must be raster, vector or text")
-                layer=Layer(name or f"Layer {len(doc.layers)+1}",Image.new("RGBA",doc.size),kind=kind)
+                layer=Layer(name or f"Layer {len(doc.layers)+1}",TiledImage(doc.size),kind=kind)
             else:
                 # Merged copy of everything visible (the composition stays editable underneath).
                 if type(include_background) is not bool: raise ValueError("include_background requires boolean")
@@ -586,7 +587,7 @@ class Engine:
             return {"deleted":layer.id,"active_layer":doc.active_layer}
         elif action=="clear":
             if layer.locked: raise ValueError("Layer is locked")
-            layer.image=Image.new("RGBA",doc.size); layer.objects=[]
+            layer.image=TiledImage(doc.size); layer.objects=[]
         elif action=="rasterize":
             if layer.locked: raise ValueError("Layer is locked")
             layer.kind="raster"; layer.objects=[]
@@ -600,7 +601,7 @@ class Engine:
         elif action=="mask_apply":
             if layer.locked: raise ValueError("Layer is locked")
             if layer.mask is not None:
-                image=layer.image.copy(); image.putalpha(ImageChops.multiply(image.getchannel("A"),layer.mask))
+                image=layer.image.to_image(); image.putalpha(ImageChops.multiply(image.getchannel("A"),layer.mask))
                 layer.image=image; layer.mask=None
                 layer.kind="raster"; layer.objects=[]
         elif action=="merge_down":
@@ -611,8 +612,8 @@ class Engine:
             # A blend pair dependent on lower backdrop cannot be represented by an ordinary merged layer.
             if below.blend!="normal" or layer.blend!="normal" or below.clipping or layer.clipping or not below.visible or not layer.visible:
                 raise ValueError("Merge requires visible, unclipped layers with normal blend; flatten for an exact composition")
-            lower=blend(Image.new("RGBA",doc.size),below.image,"normal",below.opacity,below.mask)
-            below.image=blend(lower,layer.image,layer.blend,layer.opacity,layer.mask)
+            lower=blend(Image.new("RGBA",doc.size),below.image.to_image(),"normal",below.opacity,below.mask)
+            below.image=blend(lower,layer.image.to_image(),layer.blend,layer.opacity,layer.mask)
             below.opacity=1; below.mask=None; below.kind="raster"; below.objects=[]
             doc.layers.remove(layer); doc.active_layer=below.id; layer=below
         elif action=="flatten":
@@ -877,7 +878,7 @@ class Engine:
         elif object_id: layer=doc.layer()
         else:
             if len(doc.layers)>=128: raise ValueError("Maximum 128 layers")
-            layer=Layer(text[:40] or "Text",Image.new("RGBA",doc.size),kind="text")
+            layer=Layer(text[:40] or "Text",TiledImage(doc.size),kind="text")
             doc.layers.insert(doc.layers.index(doc.layer())+1,layer)
         if layer.locked or layer.kind!="text": raise ValueError("Text needs an unlocked text layer")
         if object_id:
@@ -944,13 +945,13 @@ class Engine:
             matrix=[a,b,ox+tx-a*ox-b*oy,d,e,oy+ty-d*ox-e*oy]
         if selection_only:
             if doc.selection is None or layer.kind!="raster": raise ValueError("selection_only requires a selected raster layer")
-            cut=layer.image.copy(); cut.putalpha(ImageChops.multiply(cut.getchannel("A"),doc.selection))
-            remainder=layer.image.copy(); remainder.putalpha(ImageChops.multiply(remainder.getchannel("A"),ImageChops.invert(doc.selection)))
+            cut=layer.image.to_image(); cut.putalpha(ImageChops.multiply(cut.getchannel("A"),doc.selection))
+            remainder=cut.copy(); remainder.putalpha(ImageChops.multiply(layer.image.getchannel("A"),ImageChops.invert(doc.selection)))
             layer.image=Image.alpha_composite(remainder,transformed(cut,matrix,resample=resample))
             doc.selection=transformed(doc.selection,matrix,resample=resample)
         else:
             # Vector/text pixels are re-rendered from their objects below, so they are not resampled.
-            if layer.kind=="raster": layer.image=transformed(layer.image,matrix,resample=resample)
+            if layer.kind=="raster": layer.image=transformed(layer.image.to_image(),matrix,resample=resample)
             else: validate_affine(matrix)
             if layer.mask is not None: layer.mask=transformed(layer.mask,matrix,resample=resample)
             if layer.kind!="raster":
@@ -1188,7 +1189,7 @@ class Engine:
         if layer.locked: raise ValueError("Layer is locked")
         if layer.kind!="raster": raise ValueError("Filters need a raster layer; rasterize text/vector first (or stamp_visible)")
         if kind not in FILTER_KINDS: raise ValueError(f"Filter kind must be one of {sorted(FILTER_KINDS)}")
-        original=layer.image
+        original=layer.image.to_image()  # filters work on whole images
         if kind=="blur":
             finite(radius,0,250,"radius")
             filtered=gaussian_blur(original,radius)
