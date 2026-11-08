@@ -15,6 +15,7 @@
   <img alt="MCP: 22 tools" src="https://img.shields.io/badge/MCP-22%20tools-6E56CF">
   <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-informational">
   <img alt="CPU only" src="https://img.shields.io/badge/GPU-not%20needed-success">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
 </p>
 
 Every painting on this page was made by an AI agent through Agent Paint's tools, stroke by stroke
@@ -364,4 +365,7 @@ The Python package is called `csp_headless` for historical reasons: the project 
 desktop-free alternative to driving Clip Studio Paint through its user interface. Agent Paint
 shares no code with Clip Studio Paint and is not affiliated with CELSYS, Inc.
 
-DejaVu Sans is bundled under its own [license](src/csp_headless/assets/DejaVu-LICENSE.txt).
+## License
+
+[MIT](LICENSE) © 2026 Eugene Serpinin. The bundled DejaVu Sans font keeps its own
+[license](src/csp_headless/assets/DejaVu-LICENSE.txt).
