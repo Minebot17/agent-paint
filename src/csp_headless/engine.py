@@ -18,12 +18,12 @@ import weakref
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
-from . import __version__
-from .model import Document, Layer, BLENDS, HISTORY_SEQ, dimensions, finite, uid
+from . import __version__, timelapse
+from .model import Document, Layer, BLENDS, HISTORY_SEQ, capture_ids, dimensions, finite, uid, unit
 from .render import (BRUSH_DEFAULTS, BRUSH_KINDS, FILTER_KINDS, PATTERN_DEFAULT_DENSITY, PATTERN_KINDS, RESAMPLING,
                      TEXT_ALIGNS, TEXT_ANCHORS, TEXT_STYLE_KEYS, TEXTURE_SPACES,
                      add_noise, apply_paint, blend, channel_shift, composite, composite_region, flood_region, font_for, fonts,
-                     gaussian_blur,
+                     gaussian_blur, grow_shrink, hue_saturation, invert, levels, threshold,
                      hard_polygon_mask, missing_glyphs, object_pixels, paint_stroke, paper_noise, pattern_coverage,
                      relief, render_objects, rgba, shape_patch, smooth_outline, text_bounds, transformed,
                      validate_affine, validate_brush, validate_dash, validate_gradient, validate_points)
@@ -34,7 +34,7 @@ from .tiles import TiledImage
 # agents sharing one server never draw into each other's active document.
 DOCUMENT_SCOPED = {"paint_layer","paint_brush","paint_strokes","paint_selection","paint_fill","paint_shape","paint_text",
                    "paint_object","paint_transform","paint_history","paint_batch","paint_view","paint_region",
-                   "paint_snapshot","paint_compare","paint_sample","paint_filter","paint_pattern"}
+                   "paint_snapshot","paint_compare","paint_sample","paint_filter","paint_pattern","paint_timelapse"}
 SCENE_TOOLS = {"paint_strokes","paint_selection","paint_fill","paint_shape","paint_text","paint_transform","paint_batch",
                "paint_filter","paint_pattern"}
 LAYER_PROPERTIES = {"name","opacity","blend","visible","locked","alpha_lock","clipping"}
@@ -42,6 +42,7 @@ BATCH_TOOLS = {"paint_layer","paint_brush","paint_strokes","paint_selection","pa
                "paint_object","paint_transform","paint_filter","paint_pattern"}
 INLINE_BATCH_LIMIT = 256
 FILE_BATCH_LIMIT = 20000
+COMPACT_RESULTS_LIMIT = 64  # larger compact batches return a summary: per-action results only on request
 STROKE_FIELDS = {"points","closed","brush","color","smooth","dash","dash_offset"}
 
 
@@ -186,6 +187,8 @@ class Engine:
             "eraser":validate_brush({"kind":"eraser","size":20}),
             "smudge":validate_brush({"kind":"smudge","size":30,"hardness":.5})}
         self.snapshots={}
+        self._recorders={}  # document id -> timelapse.Recorder (recording is off unless started)
+        self._unit_hook=None  # set only by a timelapse replay: called as strokes/actions complete
 
     # --- per-call state (thread-local: concurrent calls never see each other's) -------------------
     @property
@@ -298,6 +301,8 @@ class Engine:
         """(lock, document id) for a top-level call. Calls on one document serialize on its lock;
         registry actions use the registry lock; opening and listing manage locks themselves."""
         action=arguments.get("action","info") if tool=="paint_document" else None
+        if tool=="paint_timelapse" and arguments.get("action")=="render":
+            return contextlib.nullcontext(),None  # replays into a private engine: no open document is touched
         if tool in DOCUMENT_SCOPED or tool=="paint_state" or action in {"info","save","export","close"}:
             target=arguments.get("document_id") or self.active_document
             lock=self._locks.get(target)
@@ -331,11 +336,32 @@ class Engine:
                 if doc is not None and doc.parked and not (tool=="paint_state" or tool=="paint_document" and
                                                              arguments.get("action","info") in {"info","close"}):
                     doc.unpark()
-                return self._call_targeted(tool,arguments)
+                recorder=self._recorders.get(target) if target is not None else None
+                if recorder is not None and timelapse.recordable(tool,arguments):
+                    return self._recorded_call(recorder,target,tool,arguments)
+                result=self._call_targeted(tool,arguments)
+                if tool=="paint_document" and isinstance(result,dict) and result.get("reloaded_from_disk"):
+                    reloaded=self._recorders.get(result.get("document_id"))
+                    if reloaded is not None: reloaded.keyframe(self.documents[result["document_id"]])
+                return result
             finally:
                 local.busy,local.signal,local.doc_id=False,None,None
                 with self._signals_lock: self._signals.discard(signal)
                 if target is not None: self._last_used[target]=time.monotonic()
+
+    def _recorded_call(self,recorder,target,tool,arguments):
+        """Run a state-changing call of a recorded document and append it to its timelapse with the
+        ids it generated. A recording failure never fails the painting call: recording stops instead."""
+        raw=copy.deepcopy(arguments)
+        with capture_ids() as ids:
+            result=self._call_targeted(tool,arguments)
+        try:
+            recorder.record(tool,raw,ids,self.documents[target])
+        except Exception as error:
+            self._recorders.pop(target,None)
+            if isinstance(result,dict):
+                result["warning"]=f"Timelapse recording stopped: {error}"
+        return result
 
     def _call_targeted(self,tool,arguments):
         target=arguments.pop("document_id",None) if tool in DOCUMENT_SCOPED else None
@@ -422,7 +448,9 @@ class Engine:
                                 "hard_edge_selections_and_shapes":True,"stroke_smoothing":True,"stroke_dash":True,
                                 "layer_id_targeting":True,"layer_names_as_ids":True,"batch_files":True,
                                 "batch_refs":True,"stamp_visible":True,"inspect_project":True,
+                                "timelapse":"optional, off by default: paint_timelapse(action='start') records one document",
                                 "document_id_targeting":sorted(DOCUMENT_SCOPED)},
+                "recording_timelapse":sorted(self._recorders),
                 "limitations":["Independent brush renderer; not CSP pixel parity or .sut/.clip compatibility",
                                "No CSP materials, animation, 3D, comics or plugin runtime",
                                "PSD/ORA export rasterizes text/vectors and bakes masks/clipping; .apaint keeps them editable"]}
@@ -473,11 +501,15 @@ class Engine:
             doc=self.documents.get(document_id or self._target())
             if doc is None: raise ValueError("Unknown document_id")
             if doc.revision!=doc.saved_revision and not force: raise ValueError("Document has unsaved changes; save or use force=true")
+            recorder=self._recorders.pop(doc.id,None)
+            stopped=recorder.stop(doc,"document closed") if recorder is not None else None
             with self.registry:  # this document's lock is held, so no call on it is running
                 if self.documents.get(doc.id) is doc:
                     del self.documents[doc.id]; self._locks.pop(doc.id,None)
                 if self.active_document==doc.id: self.active_document=next(iter(self.documents),None)
-            return {"closed":doc.id,"active_document":self.active_document}
+            result={"closed":doc.id,"active_document":self.active_document}
+            if stopped is not None: result["timelapse"]=stopped
+            return result
         elif action=="save":
             destination=path or self.doc.path
             if not destination: raise ValueError("path is required for first save")
@@ -546,19 +578,42 @@ class Engine:
     def _layer_result(self,doc,layer,objects=True):
         return {**layer.info(objects),"index":doc.layers.index(layer),"layer_count":len(doc.layers)}
 
+    @staticmethod
+    def _unique_name(doc,base,ignore=None):
+        """base, else 'base 2', 'base 3'...: automatic names never collide, so names keep working as ids."""
+        taken={l.name for l in doc.layers if l is not ignore}
+        if base not in taken: return base
+        number=2
+        while f"{base} {number}" in taken: number+=1
+        return f"{base} {number}"
+
+    @staticmethod
+    def _free_name(doc,name,ignore=None):
+        """An explicit layer name must be unique: names address layers like ids do."""
+        if not isinstance(name,str) or not name: raise ValueError("Layer name must be a non-empty string")
+        clash=next((l for l in doc.layers if l.name==name and l is not ignore),None)
+        if clash is not None:
+            raise ValueError(f"A layer named {name!r} already exists (id {clash.id}); layer names address layers, "
+                             "so choose another name (or update/delete that layer)")
+        return name
+
     def paint_layer(self,action="list",layer_id=None,name=None,kind="raster",properties=None,index=None,position=None,
                     include_background=True):
         doc=self.doc
         if action=="list": return {"layers":doc.layers_info(),"active_layer":doc.active_layer,"order":"bottom-to-top"}
+        if properties and "name" in properties and action in {"create","stamp_visible"}:
+            self._free_name(doc,properties["name"])
         if action in {"create","stamp_visible"}:
             if len(doc.layers)>=128: raise ValueError("Maximum 128 layers")
             if action=="create":
                 if kind not in {"raster","vector","text"}: raise ValueError("Layer kind must be raster, vector or text")
-                layer=Layer(name or f"Layer {len(doc.layers)+1}",TiledImage(doc.size),kind=kind)
+                layer=Layer(self._free_name(doc,name) if name else self._unique_name(doc,f"Layer {len(doc.layers)+1}"),
+                            TiledImage(doc.size),kind=kind)
             else:
                 # Merged copy of everything visible (the composition stays editable underneath).
                 if type(include_background) is not bool: raise ValueError("include_background requires boolean")
-                layer=Layer(name or "Visible stamp",composite(doc,not include_background))
+                layer=Layer(self._free_name(doc,name) if name else self._unique_name(doc,"Visible stamp"),
+                            composite(doc,not include_background))
             # Properties are honoured on create (previously they were silently ignored).
             if properties: self._layer_properties(layer,properties)
             where=self._stack_position(doc,index,position,"above_active" if action=="create" else "top",extra=1)
@@ -572,9 +627,11 @@ class Engine:
             # clone() drops private copy-on-write/history bookkeeping that deepcopy would duplicate.
             source=layer; layer=source.clone(); layer.image=source.image.copy()
             layer.mask=source.mask.copy() if source.mask is not None else None
-            layer.id=uid(); layer.name=name or layer.name+" copy"
-            doc.layers.insert(doc.layers.index(doc.layer(layer_id))+1,layer); doc.active_layer=layer.id
-        elif action=="update": self._layer_properties(layer,properties or {})
+            layer.id=uid(); layer.name=self._free_name(doc,name) if name else self._unique_name(doc,source.name+" copy")
+            doc.layers.insert(doc.layers.index(source)+1,layer); doc.active_layer=layer.id
+        elif action=="update":
+            if properties and "name" in properties: self._free_name(doc,properties["name"],ignore=layer)
+            self._layer_properties(layer,properties or {})
         elif action=="reorder":
             if index is None and position is None: raise ValueError("reorder needs index (0 = bottom) or position top/bottom")
             if position=="above_active": raise ValueError("reorder position is top or bottom (or give an index)")
@@ -609,13 +666,25 @@ class Engine:
             if not pos: raise ValueError("No layer below")
             below=doc.layers[pos-1]
             if layer.locked or below.locked: raise ValueError("Layer is locked")
-            # A blend pair dependent on lower backdrop cannot be represented by an ordinary merged layer.
-            if below.blend!="normal" or layer.blend!="normal" or below.clipping or layer.clipping or not below.visible or not layer.visible:
-                raise ValueError("Merge requires visible, unclipped layers with normal blend; flatten for an exact composition")
+            if not below.visible or not layer.visible: raise ValueError("Merge needs both layers visible")
+            if below.blend!="normal" or below.clipping:
+                raise ValueError("The lower layer must have normal blend and no clipping; use stamp_visible or flatten "
+                                 "for an exact merged copy")
             lower=blend(Image.new("RGBA",doc.size),below.image.to_image(),"normal",below.opacity,below.mask)
-            below.image=blend(lower,layer.image.to_image(),layer.blend,layer.opacity,layer.mask)
+            # A clipped upper layer shows only where the lower one has coverage, exactly as in the composite.
+            upper_mask=layer.mask
+            if layer.clipping:
+                coverage=lower.getchannel("A")
+                upper_mask=ImageChops.multiply(upper_mask,coverage) if upper_mask is not None else coverage
+            merged_blend=layer.blend
+            below.image=blend(lower,layer.image.to_image(),layer.blend,layer.opacity,upper_mask)
             below.opacity=1; below.mask=None; below.kind="raster"; below.objects=[]
             doc.layers.remove(layer); doc.active_layer=below.id; layer=below
+            if merged_blend!="normal":
+                result=self._layer_result(doc,layer,objects=False)
+                result["note"]=(f"The {merged_blend} layer was blended with the lower layer only. Where the lower layer "
+                                "is transparent or partly transparent the picture can change; stamp_visible gives an exact copy")
+                return result
         elif action=="flatten":
             if any(l.locked for l in doc.layers): raise ValueError("Unlock layers before flattening")
             layer=Layer(name or "Flattened",composite(doc)); doc.layers=[layer]; doc.active_layer=layer.id; doc.background=None
@@ -625,8 +694,9 @@ class Engine:
     @staticmethod
     def _layer_properties(layer,props):
         if set(props)-LAYER_PROPERTIES: raise ValueError(f"Unknown layer properties: {sorted(set(props)-LAYER_PROPERTIES)}")
+        props=dict(props)
         for key,value in props.items():
-            if key=="opacity": finite(value,0,1)
+            if key=="opacity": props[key]=unit(value,"layer opacity")
             elif key=="blend" and value not in BLENDS: raise ValueError("Unsupported blend mode")
             elif key in {"visible","locked","alpha_lock","clipping"} and type(value) is not bool: raise ValueError(f"{key} requires boolean")
             elif key=="name" and not isinstance(value,str): raise ValueError("name requires string")
@@ -675,15 +745,16 @@ class Engine:
         return [(x*(self.doc.width-1),y*(self.doc.height-1),p) for x,y,p in validated]
 
     def paint_strokes(self,strokes,coordinate_space="document",expected_revision=None,layer_id=None,brush=None,color=None,
-                      smooth=False):
-        """Strokes into layer_id (default: active layer, which stays active). Call-level brush/color/smooth are
-        defaults for every stroke; per-stroke values override them."""
+                      smooth=False,dash=None,dash_offset=None):
+        """Strokes into layer_id (default: active layer, which stays active). Call-level brush/color/smooth/dash
+        are defaults for every stroke; per-stroke values override them. An empty list paints nothing."""
         doc=self.doc; layer=doc.layer(layer_id)
         if expected_revision is not None and expected_revision!=doc.revision: raise ValueError("Document revision conflict")
         if layer.locked or layer.kind=="text":
             raise ValueError(f"Layer {layer.name!r} is {'locked' if layer.locked else 'a text layer'}; target an unlocked raster or vector layer")
-        if not isinstance(strokes,list) or not 1<=len(strokes)<=1024: raise ValueError("Expected 1..1024 strokes; use paint_batch for more")
+        if not isinstance(strokes,list) or len(strokes)>1024: raise ValueError("Expected a list of 0..1024 strokes; use paint_batch for more")
         if type(smooth) is not bool: raise ValueError("smooth requires boolean")
+        if dash is not None: validate_dash(dash,dash_offset or 0)
         base=validate_brush({**self.brush,**(brush or {})})
         default_color=color if color is not None else self.color; rgba(default_color)
         plans=[]
@@ -695,23 +766,29 @@ class Engine:
             pts=self._points(stroke["points"],coordinate_space)
             curve=stroke.get("smooth",smooth)
             if type(curve) is not bool: raise ValueError("smooth requires boolean")
-            dash=validate_dash(stroke.get("dash"),stroke.get("dash_offset",0))
+            pattern=stroke.get("dash",dash)
+            offset=stroke.get("dash_offset",dash_offset if dash_offset is not None else 0)
+            stroke=dict(stroke,dash_offset=offset)
+            dash_values=validate_dash(pattern,offset)
             if layer.kind=="vector" and (settings["kind"] in {"eraser","smudge","watercolor"} or doc.selection is not None):
                 raise ValueError("Vector strokes require an ordinary brush and no pixel selection; rasterize for wet/eraser operations")
             if settings["kind"]=="eraser" and layer.alpha_lock:
                 raise ValueError(f"Layer {layer.name!r} has alpha_lock=true, so the eraser cannot change it. "
                                  "Unlock alpha with paint_layer(action='update', properties={'alpha_lock': false}) first")
-            plans.append((pts,settings,colour,bool(stroke.get("closed",False)),curve,dash,stroke.get("dash_offset",0)))
+            plans.append((pts,settings,colour,bool(stroke.get("closed",False)),curve,dash_values,offset))
         boxes=[]
-        for pts,settings,colour,closed,curve,dash,offset in plans:
+        hook=self._unit_hook  # timelapse replay only: one frame opportunity per stroke
+        for pts,settings,colour,closed,curve,pattern,offset in plans:
             if self._signal.is_set(): raise InterruptedError("Painting aborted; transaction rolled back")
-            boxes.append(paint_stroke(layer,doc.selection,pts,settings,colour,closed,self._signal,curve,dash,offset))
+            boxes.append(paint_stroke(layer,doc.selection,pts,settings,colour,closed,self._signal,curve,pattern,offset))
             if layer.kind=="vector":
                 obj={"id":uid(),"type":"stroke","points":pts,"brush":settings,"color":colour,"closed":closed}
                 if curve: obj["smooth"]=True
-                if dash: obj["dash"]=dash; obj["dash_offset"]=offset
+                if pattern: obj["dash"]=pattern; obj["dash_offset"]=offset
                 layer.objects.append(obj)
+            if hook is not None: hook()
         result={"painted":len(plans),"layer_id":layer.id,"pressure_applied":True,"synchronous":True}
+        if not plans: result["note"]="No strokes: nothing painted"
         drawn=[b for b in boxes if b]
         result["bbox"]=[min(b[0] for b in drawn),min(b[1] for b in drawn),max(b[2] for b in drawn),max(b[3] for b in drawn)] if drawn else None
         if len(boxes)<=64: result["bounds"]=boxes
@@ -734,18 +811,30 @@ class Engine:
 
     @staticmethod
     def _selection_box(rectangle):
-        """Integer [l,t,r,b] that may extend past the canvas; drawing clips it."""
+        """Integer [l,t,r,b] that may extend past the canvas; drawing clips it. Corners may come in either
+        order. None when the rectangle covers no whole pixel after rounding (an empty area, not an error)."""
         if rectangle is None or len(rectangle)!=4: raise ValueError("rectangle is [left,top,right,bottom]")
         l,t,r,b=[round(finite(v,-100000,100000)) for v in rectangle]
-        if l>=r or t>=b: raise ValueError("Rectangle needs left<right and top<bottom (at least one pixel after rounding)")
-        return l,t,r,b
+        l,r=sorted((l,r)); t,b=sorted((t,b))
+        return None if l>=r or t>=b else (l,t,r,b)
+
+    def _polygon_area(self,points,smooth=False):
+        """Antialiased coverage mask of a polygon (smooth=true: a curve through the points)."""
+        doc=self.doc
+        pts=validate_points(points,3)
+        outline=smooth_outline(pts,True) if smooth else [(x,y) for x,y,p in pts]
+        aa=3 if doc.width*doc.height<=4_000_000 else 1
+        region=Image.new("L",(doc.width*aa,doc.height*aa))
+        ImageDraw.Draw(region).polygon([(x*aa,y*aa) for x,y in outline],fill=255)
+        return region.resize(doc.size,Image.Resampling.BOX) if aa!=1 else region
 
     def paint_selection(self,action="none",points=None,rectangle=None,point=None,operation="replace",radius=0,
-                        tolerance=0,sample_merged=False,antialias=True,smooth=False,layer_id=None):
+                        tolerance=0,sample_merged=False,antialias=True,smooth=False,layer_id=None,threshold=None):
         doc=self.doc
         if operation not in {"replace","add","subtract","intersect"}: raise ValueError("Unknown selection operation")
         if type(antialias) is not bool: raise ValueError("antialias requires boolean")
         if type(smooth) is not bool: raise ValueError("smooth requires boolean")
+        note=None
         if action=="none": doc.selection=None; return {"selection":None}
         if action=="all": mask=Image.new("L",doc.size,255)
         elif action in {"invert","feather","grow","shrink"}:
@@ -754,9 +843,7 @@ class Engine:
             mask=doc.selection.copy()
             if action=="invert": mask=ImageChops.invert(mask)
             elif action=="feather": mask=mask.filter(ImageFilter.GaussianBlur(radius))
-            else:
-                kernel=round(radius)*2+1
-                mask=mask.filter(ImageFilter.MaxFilter(kernel) if action=="grow" else ImageFilter.MinFilter(kernel))
+            else: mask=grow_shrink(mask,radius,action=="grow")  # round, not square: circles stay circles
         elif action=="flood": mask=self._flood(point,tolerance,sample_merged,layer_id)
         elif action=="polygon" and not antialias:
             # Same pixel-centre rule as hard polygon shapes: [x0,x1) like hard rectangles.
@@ -772,13 +859,21 @@ class Engine:
                 draw.polygon([(x*aa,y*aa) for x,y in outline],fill=255)
             else:
                 box=self._selection_box(rectangle)
-                # Rectangle edges use the same half-open bounds as snapshot crops.
-                box=(box[0]*aa,box[1]*aa,box[2]*aa-1,box[3]*aa-1)
-                (draw.rectangle if action=="rectangle" else draw.ellipse)(box,fill=255)
+                if box is None:
+                    note="Zero-size rectangle/ellipse: it selects nothing"
+                else:
+                    # Rectangle edges use the same half-open bounds as snapshot crops.
+                    box=(box[0]*aa,box[1]*aa,box[2]*aa-1,box[3]*aa-1)
+                    (draw.rectangle if action=="rectangle" else draw.ellipse)(box,fill=255)
             # Box (area) downsampling gives exact coverage: integer rectangles stay perfectly hard,
             # fractional edges get fractional coverage, and nothing rings outside the shape.
             if aa!=1: mask=mask.resize(doc.size,Image.Resampling.BOX)
-        elif action=="from_layer": mask=doc.layer(layer_id).image.getchannel("A")
+        elif action=="from_layer":
+            mask=doc.layer(layer_id).image.getchannel("A")
+            if threshold is not None:
+                # Hard selection of the pixels at least this opaque: soft glazes still select fully.
+                level=round(finite(threshold,1,255,"threshold"))
+                mask=mask.point(lambda a: 255 if a>=level else 0)
         else: raise ValueError("Unknown selection action")
         if doc.selection is not None and action not in {"invert","feather","grow","shrink"}:
             if operation=="add": mask=ImageChops.lighter(doc.selection,mask)
@@ -789,13 +884,28 @@ class Engine:
         elif operation=="subtract" and doc.selection is None:
             mask=ImageChops.invert(mask)
         doc.selection=mask
-        return {"has_selection":True,"bbox":mask.getbbox(),"operation":operation}
+        result={"has_selection":True,"bbox":mask.getbbox(),"operation":operation}
+        if note: result["note"]=note
+        return result
 
     def paint_fill(self,kind="solid",color=None,color2="#FFFFFF",start=None,end=None,point=None,tolerance=0,
-                   sample_merged=False,opacity=1,blend_mode="normal",layer_id=None):
+                   sample_merged=False,opacity=1,blend_mode="normal",layer_id=None,points=None,smooth=False):
+        """Fill inside the selection, further limited to the polygon points when given (smooth=true: a
+        curve through them), so a gradient can fill one shape without a separate selection call."""
         doc=self.doc; layer=doc.writable(layer_id)
-        finite(opacity,0,1,"opacity")
+        opacity=unit(opacity,"opacity")
         if blend_mode not in BLENDS: raise ValueError(f"Unsupported blend mode; use one of {sorted(BLENDS)}")
+        if type(smooth) is not bool: raise ValueError("smooth requires boolean")
+        if points is not None:
+            area=self._polygon_area(points,smooth)
+            if kind=="clear":
+                if layer.alpha_lock:
+                    raise ValueError(f"Layer {layer.name!r} has alpha_lock=true, so clearing cannot change its transparency. "
+                                     "Unlock alpha with paint_layer(action='update', properties={'alpha_lock': false}) first")
+                selection=ImageChops.multiply(doc.selection,area) if doc.selection is not None else area
+                apply_paint(layer,Image.new("RGBA",doc.size,(0,0,0,round(255*opacity))),(0,0,*doc.size),selection,erase=True)
+                return {"filled":"clear","layer_id":layer.id,"selection_applied":doc.selection is not None,"area":"polygon"}
+        else: area=None
         if kind=="clear":
             if layer.alpha_lock:
                 # Clearing changes only alpha, which alpha lock forbids: fail loudly instead of a silent no-op.
@@ -807,6 +917,7 @@ class Engine:
             return {"filled":"clear","layer_id":layer.id,"selection_applied":doc.selection is not None}
         c1=rgba(color or self.color); c2=rgba(color2)
         mask=doc.selection
+        if area is not None: mask=ImageChops.multiply(mask,area) if mask is not None else area
         if kind=="flood":
             flood=self._flood(point,tolerance,sample_merged,layer.id)
             mask=ImageChops.multiply(mask,flood) if mask is not None else flood
@@ -829,7 +940,9 @@ class Engine:
         else: raise ValueError("Fill kind must be solid, flood, linear, radial or clear")
         if opacity!=1: image.putalpha(image.getchannel("A").point(lambda a:round(a*opacity)))
         apply_paint(layer,image,(0,0,*doc.size),mask,False,blend_mode)
-        return {"filled":kind,"layer_id":layer.id,"selection_applied":mask is not None}
+        result={"filled":kind,"layer_id":layer.id,"selection_applied":doc.selection is not None}
+        if area is not None: result["area"]="polygon"
+        return result
 
     def paint_shape(self,shape,points,fill=None,outline=None,width=1,radius=12,editable=False,antialias=True,
                     smooth=False,bleed=0,layer_id=None):
@@ -838,15 +951,25 @@ class Engine:
             raise ValueError(f"Layer {layer.name!r} is {'locked' if layer.locked else 'a text layer'}; target an unlocked raster/vector layer")
         if shape not in {"rectangle","rounded_rectangle","ellipse","polygon","line","bezier"}:
             raise ValueError("shape is rectangle, rounded_rectangle, ellipse, polygon, line or bezier")
-        pts=validate_points(points,2 if shape!="polygon" else 3)
+        pts=validate_points(points,1 if shape=="polygon" else 2)
         finite(width,.1,4096,"width"); finite(radius,0,4096,"radius"); finite(bleed,0,64,"bleed")
         if type(antialias) is not bool: raise ValueError("antialias requires boolean")
         if type(smooth) is not bool: raise ValueError("smooth requires boolean")
-        if shape in {"rectangle","ellipse","rounded_rectangle"}:
-            if len(pts)!=2 or pts[0][0]>=pts[1][0] or pts[0][1]>=pts[1][1]: raise ValueError("Shape needs top-left/bottom-right corners [[left,top],[right,bottom]]")
         if fill is not None: rgba(fill)
         if outline is not None: rgba(outline)
         if fill is None and outline is None: raise ValueError("Provide fill and/or outline color")
+        skipped=None
+        if shape in {"rectangle","ellipse","rounded_rectangle"}:
+            if len(pts)!=2: raise ValueError("Box shapes take two corners [[left,top],[right,bottom]]")
+            (x0,y0,p0),(x1,y1,p1)=pts
+            pts=[(min(x0,x1),min(y0,y1),p0),(max(x0,x1),max(y0,y1),p1)]  # corners may come in either order
+            if pts[0][0]==pts[1][0] or pts[0][1]==pts[1][1]: skipped="zero-size box: nothing painted"
+        elif shape=="polygon" and len({(round(x,3),round(y,3)) for x,y,p in pts})<3:
+            skipped="polygon with fewer than 3 distinct points: nothing painted"
+        if skipped:
+            # Generated plans often produce degenerate shapes (a motif clipped away, a zero radius):
+            # skipping them keeps the batch instead of rolling back everything.
+            return {"object_id":None,"layer_id":layer.id,"editable":layer.kind=="vector","bounds":None,"skipped":skipped}
         obj={"id":uid(),"type":"shape","shape":shape,"points":pts,"fill":fill,"outline":outline,"width":width,"radius":radius}
         if not antialias: obj["antialias"]=False
         if smooth: obj["smooth"]=True
@@ -861,7 +984,9 @@ class Engine:
         return {"object_id":obj["id"] if layer.kind=="vector" else None,"layer_id":layer.id,"editable":layer.kind=="vector",
                 "bounds":list(box) if box else None}
 
-    def paint_text(self,text,x,y,style=None,layer_id=None,object_id=None):
+    def paint_text(self,text,x,y,style=None,layer_id=None,object_id=None,layer_name=None):
+        """New text goes into a new text layer (named layer_name, else after the text) unless layer_id names
+        an existing text layer; several objects can share one text layer."""
         doc=self.doc
         if not isinstance(text,str) or len(text)>16000: raise ValueError("Text must contain at most 16000 characters")
         finite(x,-100000,100000); finite(y,-100000,100000)
@@ -878,9 +1003,14 @@ class Engine:
         elif object_id: layer=doc.layer()
         else:
             if len(doc.layers)>=128: raise ValueError("Maximum 128 layers")
-            layer=Layer(text[:40] or "Text",TiledImage(doc.size),kind="text")
+            title=self._free_name(doc,layer_name) if layer_name else self._unique_name(doc,text[:40] or "Text")
+            layer=Layer(title,TiledImage(doc.size),kind="text")
             doc.layers.insert(doc.layers.index(doc.layer())+1,layer)
-        if layer.locked or layer.kind!="text": raise ValueError("Text needs an unlocked text layer")
+        if layer.locked: raise ValueError(f"Text layer {layer.name!r} is locked")
+        if layer.kind!="text":
+            raise ValueError(f"Layer {layer.name!r} is a {layer.kind} layer; text lives on text layers. Omit layer_id to create "
+                             "a new text layer (layer_name names it), or create one with paint_layer(action='create', kind='text') "
+                             "and pass its id; stamp_visible or rasterize it later to treat the letters as pixels")
         if object_id:
             obj=next((o for o in layer.objects if o["id"]==object_id),None)
             if obj is None: raise ValueError("Unknown text object")
@@ -995,22 +1125,31 @@ class Engine:
         else: limit=INLINE_BATCH_LIMIT
         if not isinstance(actions,list) or not 1<=len(actions)<=limit:
             raise ValueError(f"Expected 1..{limit} actions" + ("; put larger plans in actions_file" if actions_file is None else "; split the plan"))
+        normalized=[]
         for index,item in enumerate(actions):
             if not isinstance(item,dict) or not {"tool"}<=set(item)<={"tool","arguments","store"} or item["tool"] not in BATCH_TOOLS:
                 raise ValueError(f"Batch action {index}: expected {{tool, arguments[, store]}} with tool in {sorted(BATCH_TOOLS)} "
                                  "(no filesystem actions or nested batches)")
             arguments=item.get("arguments",{})
             if not isinstance(arguments,dict): raise ValueError(f"Batch action {index}: arguments must be an object")
+            if "store" in arguments:
+                # "store" belongs beside tool/arguments; plans often put it inside: accept it there too.
+                if "store" in item: raise ValueError(f"Batch action {index}: store is given twice")
+                arguments={k:v for k,v in arguments.items() if k!="store"}
+                item={**item,"arguments":arguments,"store":item["arguments"]["store"]}
+            normalized.append(item)
             if arguments.get("document_id") not in {None,self._target()}:
                 raise ValueError("A batch edits one document; pass document_id to paint_batch, not to its actions")
             if item["tool"]=="paint_brush" and arguments.get("action") in {"import_presets","export_presets"}:
                 raise ValueError("Filesystem actions are not permitted inside a batch")
             if "store" in item and (not isinstance(item["store"],str) or not item["store"] or "." in item["store"]):
                 raise ValueError(f"Batch action {index}: store is a name without dots")
+        actions=normalized
         self._batch_depth+=1
         outer=self._audit_buffer is None
         if outer: self._audit_buffer=[]
-        collected=[]; stored={}; counts={}; bbox=None
+        collected=[]; stored={}; counts={}; bbox=None; warnings=[]; skipped=0
+        hook=self._unit_hook  # timelapse replay only: strokes report themselves, other actions here
         try:
             for index,item in enumerate(actions):
                 if self._signal.is_set(): raise InterruptedError("Batch aborted")
@@ -1021,17 +1160,31 @@ class Engine:
                     raise ValueError(f"Batch action {index} ({item['tool']}) failed; entire batch rolled back: {error}") from error
                 counts[item["tool"]]=counts.get(item["tool"],0)+1
                 small=compact_result(result)
-                if isinstance(small,dict) and isinstance(small.get("bbox"),list) and len(small["bbox"])==4:
-                    b=small["bbox"]; bbox=b if bbox is None else [min(bbox[0],b[0]),min(bbox[1],b[1]),max(bbox[2],b[2]),max(bbox[3],b[3])]
+                if isinstance(small,dict):
+                    if isinstance(small.get("bbox"),list) and len(small["bbox"])==4:
+                        b=small["bbox"]; bbox=b if bbox is None else [min(bbox[0],b[0]),min(bbox[1],b[1]),max(bbox[2],b[2]),max(bbox[3],b[3])]
+                    # Warnings (missing glyphs, merge notes) must survive even when results are summarized.
+                    for key in ("warning","note"):
+                        if not small.get(key) or key=="note" and item["tool"]!="paint_layer": continue
+                        if len(warnings)<20: warnings.append({"action":index,"tool":item["tool"],key:small[key]})
+                    if small.get("skipped"): skipped+=1
                 if "store" in item: stored[item["store"]]=result
                 if results=="full": collected.append(result)
                 elif results=="compact": collected.append(small)
+                if hook is not None and item["tool"]!="paint_strokes": hook()
         finally:
             self._batch_depth-=1
             if outer: self._flush_audit()
         summary={"completed":len(actions),"atomic":True,"undo_steps":1,"tools":counts,"bbox":bbox,
                  "stored":{name:compact_result(value) for name,value in stored.items()}}
-        if results!="none": summary["results"]=collected
+        if warnings: summary["warnings"]=warnings
+        if skipped: summary["skipped_degenerate"]=skipped
+        if results=="full" or results=="compact" and len(collected)<=COMPACT_RESULTS_LIMIT: summary["results"]=collected
+        elif results=="compact":
+            # Per-action results of a big plan would flood the reply (tens of thousands of characters).
+            summary["results_omitted"]=len(collected)
+            summary["note"]=(f"Per-action results are omitted above {COMPACT_RESULTS_LIMIT} actions; use store/$ref for ids "
+                             "you need, or results='full'")
         if actions_file is not None: summary["actions_file"]=str(Path(actions_file).expanduser().resolve())
         return summary
 
@@ -1094,12 +1247,15 @@ class Engine:
         else: raise ValueError("source must be composite, layer, selection or mask")
         if use_view and doc.view.get("rotation"): image=image.rotate(-doc.view["rotation"],Image.Resampling.BICUBIC,expand=True)
         image.thumbnail((max_side,max_side),Image.Resampling.LANCZOS)
-        factor=1
+        factor=1; upscale_note=None
         if upscale:
             # Integer nearest-neighbour enlargement keeps every document pixel a crisp square (pixel art, fine detail).
             factor=min(64,max_side//max(image.size))
             if factor>1: image=image.resize((image.width*factor,image.height*factor),Image.Resampling.NEAREST)
-            else: factor=1
+            else:
+                factor=1
+                upscale_note=(f"upscale did nothing: max_side {max_side} is less than twice the crop's longest side "
+                              f"{max(image.size)}; raise max_side or take a smaller crop")
         identifier=uid(); directory=self.state_dir/"snapshots"; directory.mkdir(exist_ok=True)
         # Encoded once: the same bytes go to the snapshot file, an optional path and the MCP response.
         data=png(image); image_path=directory/(identifier+".png"); image_path.write_bytes(data)
@@ -1110,6 +1266,7 @@ class Engine:
               "image_path":str(image_path),"size":list(image.size),"sha256":hashlib.sha256(image.tobytes()).hexdigest(),
               "document_pixels_per_image_pixel":[(box[2]-box[0])/image.width,(box[3]-box[1])/image.height],
               "upscale_factor":factor}
+        if upscale_note: info["note"]=upscale_note
         if compare_to:
             prior=self._snapshot_record(compare_to)
             if prior["descriptor"]!=descriptor: raise ValueError("Snapshots must cover the same document, layer and rectangle")
@@ -1183,7 +1340,7 @@ class Engine:
         return {"fonts":result,"supports":supports}
 
     def paint_filter(self,kind,radius=0,offsets=None,amount=.1,seed=1,monochrome=True,layer_id=None,angle=135,
-                     source="luminance"):
+                     source="luminance",depth=1.0,black=0,white=255,gamma=1.0,level=128,hue=0,saturation=1.0,lightness=0):
         """Pixel filters on a raster layer, limited to the selection and honouring alpha lock."""
         doc=self.doc; layer=doc.layer(layer_id)
         if layer.locked: raise ValueError("Layer is locked")
@@ -1194,9 +1351,21 @@ class Engine:
             finite(radius,0,250,"radius")
             filtered=gaussian_blur(original,radius)
         elif kind=="relief":
-            finite(radius,0,50,"radius"); finite(amount,0,1,"amount"); finite(angle,-36000,36000,"angle")
+            finite(radius,0,50,"radius"); amount=unit(amount,"amount"); finite(angle,-36000,36000,"angle")
+            finite(depth,.1,50,"depth")
             if source not in {"luminance","alpha"}: raise ValueError("relief source is luminance (brushwork) or alpha (cut shapes)")
-            filtered=relief(original,angle,amount,radius,source)
+            filtered=relief(original,angle,amount,radius,source,depth)
+        elif kind=="levels":
+            finite(black,0,254,"black"); finite(white,1,255,"white"); finite(gamma,.1,10,"gamma")
+            if black>=white: raise ValueError("levels needs black < white")
+            filtered=levels(original,black,white,gamma)
+        elif kind=="threshold":
+            filtered=threshold(original,finite(level,0,255,"level"))
+        elif kind=="invert":
+            filtered=invert(original)
+        elif kind=="hue_saturation":
+            finite(hue,-360,360,"hue"); finite(saturation,0,4,"saturation"); finite(lightness,-1,1,"lightness")
+            filtered=hue_saturation(original,hue,saturation,lightness)
         elif kind=="channel_shift":
             offsets=offsets or {}
             if not isinstance(offsets,dict) or not offsets or set(offsets)-{"r","g","b"}:
@@ -1208,7 +1377,7 @@ class Engine:
                 parsed[key]=(int(value[0]),int(value[1]))
             filtered=channel_shift(original,parsed)
         else:
-            finite(amount,0,1)
+            amount=unit(amount,"amount")
             if type(seed) is not int or seed<0: raise ValueError("seed must be a nonnegative integer")
             if type(monochrome) is not bool: raise ValueError("monochrome requires boolean")
             filtered=add_noise(original,amount,seed,monochrome)
@@ -1226,15 +1395,16 @@ class Engine:
         doc=self.doc; layer=doc.writable(layer_id)
         if kind not in PATTERN_KINDS: raise ValueError(f"Pattern kind must be one of {sorted(PATTERN_KINDS)}")
         colour=rgba(color or self.color)
-        finite(opacity,0,1,"opacity")
+        opacity=unit(opacity,"opacity")
         if blend_mode not in BLENDS: raise ValueError(f"Unsupported blend mode; use one of {sorted(BLENDS)}")
         if angles is None: angles=[angle]
         if not isinstance(angles,list) or not 1<=len(angles)<=8: raise ValueError("angles is a list of 1..8 directions in degrees")
         for a in angles: finite(a,-36000,36000,"angle")
         finite(spacing,1 if kind!="hatch" else .75,4096,"spacing"); finite(width,.1,512,"width")
-        finite(jitter,0,1,"jitter"); finite(taper,0,1,"taper"); finite(size_jitter,0,1,"size_jitter"); finite(texture,0,1,"texture")
+        jitter=unit(jitter,"jitter"); taper=unit(taper,"taper"); size_jitter=unit(size_jitter,"size_jitter")
+        texture=unit(texture,"texture")
         if density is None: density=PATTERN_DEFAULT_DENSITY[kind]
-        finite(density,0,1,"density")
+        density=unit(density,"density")
         if size is None: size=spacing*.5 if kind=="stipple" else spacing*1.15
         finite(size,.1,4096,"size")
         if type(cell) is not int or not 1<=cell<=256: raise ValueError("cell is an integer 1..256 (dither pixel size)")
@@ -1247,16 +1417,11 @@ class Engine:
         area=doc.selection
         if points is not None or rectangle is not None:
             if points is not None and rectangle is not None: raise ValueError("Use points (polygon) or rectangle, not both")
-            if points is not None:
-                pts=validate_points(points,3)
-                outline=smooth_outline(pts,True) if smooth else [(x,y) for x,y,p in pts]
-                aa=3 if doc.width*doc.height<=4_000_000 else 1
-                region=Image.new("L",(doc.width*aa,doc.height*aa))
-                ImageDraw.Draw(region).polygon([(x*aa,y*aa) for x,y in outline],fill=255)
-                if aa!=1: region=region.resize(doc.size,Image.Resampling.BOX)
+            if points is not None: region=self._polygon_area(points,smooth)
             else:
-                l,t,r,b=self._selection_box(rectangle)
-                region=Image.new("L",doc.size); ImageDraw.Draw(region).rectangle((l,t,r-1,b-1),fill=255)
+                box=self._selection_box(rectangle)
+                region=Image.new("L",doc.size)
+                if box is not None: ImageDraw.Draw(region).rectangle((box[0],box[1],box[2]-1,box[3]-1),fill=255)
             area=ImageChops.multiply(area,region) if area is not None else region
         box=area.getbbox() if area is not None else (0,0,*doc.size)
         if box is None: return {"pattern":kind,"layer_id":layer.id,"marks":0,"bbox":None,"note":"Empty area: nothing painted"}
@@ -1272,8 +1437,41 @@ class Engine:
                 "area":"polygon" if points is not None else "rectangle" if rectangle is not None else
                        "selection" if doc.selection is not None else "layer"}
 
+    def paint_timelapse(self,action="status",path=None,output=None,fps=30,seconds=None,hold=2.0,max_side=1280,
+                        overwrite=False):
+        """Optional timelapse, off by default. start: record every later state-changing call of this
+        document into the folder path (default under the state dir). stop: finish the recording.
+        status: is this document recorded. render: replay the recording folder path in a private engine
+        into an MP4 (output, default <folder>/timelapse.mp4) of about `seconds` plus `hold` at the end."""
+        if action=="render":
+            if not path: raise ValueError("path is the recording folder that start/stop returned")
+            check_path(path)
+            if output is not None: check_path(output)
+            return timelapse.render(path,output,fps=fps,seconds=seconds,hold=hold,max_side=max_side,overwrite=overwrite,
+                                    stop=self._signal.is_set)
+        doc=self.doc
+        recorder=self._recorders.get(doc.id)
+        if action=="start":
+            if recorder is not None:
+                raise ValueError(f"This document is already recorded into {recorder.folder}; stop that recording first")
+            if path: check_path(path)
+            folder=Path(path).expanduser() if path else self.state_dir/"timelapses"/timelapse.default_name(doc)
+            with self.registry: presets=copy.deepcopy(self.presets)
+            recorder=timelapse.Recorder.start(folder,doc,presets,overwrite)
+            self._recorders[doc.id]=recorder
+            return {"recording":True,"document_id":doc.id,"path":str(recorder.folder),
+                    "note":"Every later change of this document is recorded until paint_timelapse(action='stop') or close. "
+                           "Render with paint_timelapse(action='render', path=...)"}
+        if action=="stop":
+            if recorder is None: raise ValueError("This document is not being recorded; paint_timelapse(action='start') begins a recording")
+            del self._recorders[doc.id]
+            return {**recorder.stop(doc,"stopped"),"next":"paint_timelapse(action='render', path=<path>) makes the MP4"}
+        if action=="status":
+            return {"document_id":doc.id,"recording":recorder is not None,**(recorder.status() if recorder else {})}
+        raise ValueError("timelapse action is start, stop, status or render")
+
 
 OPERATIONS=("paint_state","paint_document","paint_layer","paint_brush","paint_strokes","paint_selection","paint_fill",
             "paint_shape","paint_text","paint_object","paint_transform","paint_history","paint_batch","paint_view",
             "paint_region","paint_snapshot","paint_compare","paint_sample","paint_fonts","paint_filter","paint_pattern",
-            "paint_abort")
+            "paint_timelapse","paint_abort")

@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>A headless painting engine for AI agents.</b><br>
-  Layers, pressure-sensitive brushes, shapes, patterns and text, served as 22 MCP tools.<br>
+  Layers, pressure-sensitive brushes, shapes, patterns and text, served as 23 MCP tools.<br>
   No window, no mouse, no GPU.
 </p>
 
@@ -12,7 +12,7 @@
 
 <p align="center">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="MCP: 22 tools" src="https://img.shields.io/badge/MCP-22%20tools-6E56CF">
+  <img alt="MCP: 23 tools" src="https://img.shields.io/badge/MCP-23%20tools-6E56CF">
   <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-informational">
   <img alt="CPU only" src="https://img.shields.io/badge/GPU-not%20needed-success">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
@@ -53,6 +53,8 @@ scripted work.
   it at once.
 - **Many agents, one server.** Each document has its own lock and its own brush: parallel agents
   paint different pictures without waiting for or disturbing each other.
+- **A timelapse when you ask for one.** Off by default. On request, `paint_timelapse` records every
+  change to a document and replays it into an MP4 of the picture being painted, stroke by stroke.
 - **A painting skill included.** [`skills/agent-paint-reference`](skills/agent-paint-reference/SKILL.md)
   teaches an agent the workflow: plan the composition, values and palette, test marks, paint in
   passes, check snapshots and verify the saved file. It also carries style recipes and lessons from
@@ -114,7 +116,7 @@ in parallel.
 - Seeded texture, a paper grain fixed to the document for chalk, pastel and charcoal, watercolour
   edge darkening
 - `smooth=true` draws a Catmull-Rom curve through the given points, pressure included (5–10 points
-  give a clean curve); `dash` makes dashed and dotted lines
+  give a clean curve); `dash` makes dashed and dotted lines, per stroke or for a whole call
 - Brush presets that can be saved, exported and imported
 
 **Shapes, selections and fills**
@@ -122,9 +124,10 @@ in parallel.
   outlines from a few points
 - Pixel-exact mode (`antialias=false`) for pixel art and seamless tiling; `bleed` hides hairline
   seams between facets
-- Selections: polygon, rectangle, ellipse, flood, layer alpha; add, subtract, intersect; feather,
-  grow, shrink
-- Fills: solid, flood, linear and radial gradients, clear to transparency
+- Selections: polygon, rectangle, ellipse, flood, layer alpha (soft, or hard by a threshold); add,
+  subtract, intersect; feather; grow and shrink by true distance, so circles stay round
+- Fills: solid, flood, linear and radial gradients, clear to transparency; any of them can be
+  limited to a polygon
 
 **Patterns and filters**
 - Hatching and cross-hatching with hand-made jitter, breaks and tapers; stipple; halftone (Ben-Day
@@ -132,7 +135,8 @@ in parallel.
 - Tone set by `density` or by a linear or radial gradient; patterns are anchored to the document,
   so neighbouring areas meet without seams
 - Gaussian blur for glows and soft shadows, channel shift for chromatic aberration and
-  misregistration, seeded noise, relief for impasto, linocut and paper cut
+  misregistration, seeded noise, relief with adjustable depth for impasto, linocut and paper cut
+- Colour adjustments: levels, threshold, invert, hue/saturation/lightness
 
 **Text**
 - Unicode text in installed fonts or the bundled DejaVu Sans: outline, scale, rotation, letter
@@ -151,9 +155,17 @@ in parallel.
 - Export to PNG, JPEG, WebP and TIFF (with integer upscaling for pixel art), OpenRaster and PSD with
   layers; import images and OpenRaster files
 
+**Timelapse**
+- Optional and off by default: record one document's changes and render an MP4 of the picture
+  being painted ([how](#timelapse))
+- The replay is exact: the video ends on the recorded pixels, and the render reports whether it did
+
 **Reliability**
 - Atomic calls and batches with rollback, undo and redo, `expected_revision` checks against
   concurrent edits, cancellation with `paint_abort`, a log of every call
+- Small slips do not cost a batch: values a hair outside 0..1 are clamped, zero-size shapes are
+  skipped and counted, an empty stroke list does nothing; layer names stay unique, so a name always
+  finds its layer
 
 ## Quick start
 
@@ -272,7 +284,7 @@ actions, one undo step) or run it against a real MCP server with `scripts/mcp_pl
 `scripts/demo.py` paints a 14-layer landscape and a brush sample sheet using only the public API.
 
 <details>
-<summary><b>All 22 MCP tools</b></summary>
+<summary><b>All 23 MCP tools</b></summary>
 
 | Tool | Purpose |
 | --- | --- |
@@ -282,10 +294,10 @@ actions, one undo step) or run it against a real MCP server with `scripts/mcp_pl
 | `paint_brush` | Brush kind, settings and colour; presets |
 | `paint_strokes` | Pressure strokes: polyline or smooth spline, dashes and dots |
 | `paint_shape` | Rectangles, ellipses, polygons, lines and Béziers; editable on vector layers |
-| `paint_selection` | Polygon, rectangle, ellipse, flood, layer alpha; boolean operations; feather, grow, shrink |
-| `paint_fill` | Solid, flood, linear and radial gradients, clear |
+| `paint_selection` | Polygon, rectangle, ellipse, flood, layer alpha (soft or by threshold); boolean operations; feather, grow, shrink |
+| `paint_fill` | Solid, flood, linear and radial gradients, clear; optionally inside a polygon |
 | `paint_pattern` | Hatching, cross-hatching, stipple, halftone and dither inside a shape or selection |
-| `paint_filter` | Blur, channel shift, noise, relief |
+| `paint_filter` | Blur, channel shift, noise, relief, levels, threshold, invert, hue/saturation |
 | `paint_text` | Create and edit Unicode text |
 | `paint_fonts` | Installed fonts, filtered by the characters they must contain |
 | `paint_object` | Get, edit, duplicate or delete vector and text objects |
@@ -297,9 +309,44 @@ actions, one undo step) or run it against a real MCP server with `scripts/mcp_pl
 | `paint_sample` | Colours at given points |
 | `paint_region` | Named document regions stored in the project |
 | `paint_view` | View zoom and rotation; drawing coordinates stay the same |
+| `paint_timelapse` | Optional timelapse: record a document's changes, render them to MP4 |
 | `paint_abort` | Cancel running operations and roll them back |
 
 </details>
+
+## Timelapse
+
+Recording is optional and off by default. Ask for it in the request:
+
+> Paint a sumi-e crane with Agent Paint and record a timelapse.
+
+The agent calls `paint_timelapse(action="start")` right after creating the document (`path` names
+the recording folder; by default it goes under the server's state directory) and paints as usual.
+Every successful change to that document is appended to the recording together with the ids it
+created: strokes, shapes, fills, layers, selections, text, filters, batches, undo. `stop`, or
+closing the document, finishes the recording. `paint_timelapse(action="render", path=...)` then
+replays it in a private engine and writes `timelapse.mp4` into the folder:
+
+- the frames follow the work one stroke or action at a time, even inside a batch of thousands of
+  strokes, and every call gets a moment on screen;
+- the build-up takes 5–20 seconds by default (`seconds`), then the finished picture stays for
+  2 seconds (`hold`);
+- large pictures are scaled down to `max_side` (1280 by default); small ones and pixel art are
+  enlarged by a whole factor with crisp pixels;
+- `verified: true` in the result means the replay ended on exactly the recorded pixels.
+
+From the command line, with PNG frames as an option:
+
+```bash
+.venv/bin/python -m csp_headless.timelapse info /path/to/recording
+.venv/bin/python -m csp_headless.timelapse render /path/to/recording -o crane.mp4 --seconds 12
+```
+
+The package also installs this as the `agent-paint-timelapse` command. Rendering needs ffmpeg: set
+`AGENT_PAINT_FFMPEG`, put `ffmpeg` on `PATH`, or install a bundled build with
+`pip install -e ".[video]"`. The encoder is chosen by a quick probe: libx264, NVIDIA NVENC, Windows
+Media Foundation, OpenH264, otherwise MPEG-4. The folder format is described in
+[docs/format.md](docs/format.md).
 
 ## Performance
 
@@ -329,12 +376,12 @@ Russian), benchmark in [scripts/perf_audit.py](scripts/perf_audit.py).
 .venv/bin/python -m pytest -q
 ```
 
-206 tests, about 10 seconds.
+231 tests, about 15 seconds. The MP4 test runs when ffmpeg is found and is skipped otherwise.
 
 ## Repository layout
 
 ```text
-src/csp_headless/   engine, renderer, tiled layers, .apaint storage, MCP server, JSONL runner
+src/csp_headless/   engine, renderer, tiled layers, .apaint storage, MCP server, JSONL runner, timelapse
 skills/             agent skill: painting workflow, style recipes, lessons from earlier studies
 scripts/            demo, MCP plan runner, benchmark, Codex registration helper
 docs/               file format, performance audit, painting log, gallery, 30 style studies
@@ -354,7 +401,7 @@ tests/              pytest suite
 ## Documentation
 
 - `paint://guide`: the compact guide agents read, served as an MCP resource
-- [docs/format.md](docs/format.md): the `.apaint` file format
+- [docs/format.md](docs/format.md): the `.apaint` file format and the timelapse recording folder
 - [docs/reference.ru.md](docs/reference.ru.md): detailed reference and version history (in Russian)
 - [docs/perf-audit.md](docs/perf-audit.md): memory and CPU audit with measurements (in Russian)
 - [docs/painting-experience.md](docs/painting-experience.md): what agents learned while painting (in Russian)

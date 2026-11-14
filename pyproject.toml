@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clip-stuido-headless"
-version = "0.4.0"
+version = "0.5.0"
 description = "A synchronous, desktop-free layered painting engine for agents with CSP MCP compatibility"
 requires-python = ">=3.11"
 license = "MIT"
@@ -13,9 +13,12 @@ dependencies = ["mcp>=1.30,<2", "Pillow>=11,<13", "numpy>=2,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "psd-tools>=1.10,<2"]
+# MP4 timelapses need an ffmpeg executable: on PATH, AGENT_PAINT_FFMPEG, or this bundled one.
+video = ["imageio-ffmpeg>=0.5"]
 
 [project.scripts]
 csp-headless = "csp_headless.server:main"
+agent-paint-timelapse = "csp_headless.timelapse:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/csp_headless"]

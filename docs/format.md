@@ -47,3 +47,33 @@ Layer/mask/selection dimensions must match the document. ZIP paths are read by n
 
 Future format changes must introduce an explicit version/migration. Do not silently repurpose fields
 to reproduce old GUI state; GUI state is outside the document model.
+
+# Timelapse recording, version 1 (engine 0.5)
+
+A folder written by `paint_timelapse(action="start")`. Recording is optional and off by default.
+
+| Entry | Meaning |
+| --- | --- |
+| `manifest.json` | `format: "agent-paint-timelapse"`, `version: 1`, engine version, `status` (`recording` or `stopped`), document id/name/size/background, `started_at`, `start_revision`, the server's brush presets at start; on stop also `stopped_at`, `reason`, `commands`, `units`, `seconds`, `final_revision`, `final_sha256` |
+| `start.apaint` | The document when recording started, in the `.apaint` format above (including the selection and the brush) |
+| `commands.jsonl` | One successful state-changing call per line, in call order |
+| `assets/` | `plan-<seq>.jsonl` copies of batch `actions_file` plans; `keyframe-<seq>.apaint` when the document was reloaded from disk while recorded |
+| `preview.png` | The finished picture, at most 512×512, written on stop |
+
+A command line is `{"seq", "t", "tool", "arguments", "units", "ids"?}`:
+- `seq` counts from 1, and `t` is seconds since the start.
+- `arguments` are the call's arguments without `document_id` and `expected_revision`. A batch
+  `actions_file` is rewritten to its `assets/` copy, relative to the folder.
+- `units` is the call's work: strokes count one by one, a batch counts its actions and their
+  strokes, and anything else counts 1.
+- `ids` are the layer/object ids the call generated, in generation order. A replay hands them back
+  so that later commands naming them still apply.
+- `tool` is an MCP tool name, or `__keyframe__` with `arguments.path` (replace the document with
+  that `.apaint`).
+- `paint_brush` `load_preset` is stored as `configure` with the resulting settings, because presets
+  are shared by everybody on a server.
+
+`final_sha256` is SHA-256 of the full-resolution composite. It covers the UTF-8 text of the size
+tuple, for example `(1600, 1200)`, followed by the RGBA bytes. A renderer reports `verified=true` when
+its replay produces the same hash. A recording cut short by a crash stays readable up to its last
+complete line.

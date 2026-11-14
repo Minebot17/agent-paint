@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFilter, ImageFont
 
-from .model import BLENDS, finite, own_pixels
+from .model import BLENDS, finite, own_pixels, unit
 from .tiles import TILE, TiledImage
 
 
@@ -210,7 +210,7 @@ def validate_brush(settings):
     finite(brush["spacing"], .01, 2, "brush spacing")
     for key in ("opacity", "hardness", "flow", "min_size", "taper_start", "taper_end", "texture", "stabilization", "mixing",
                 "edge_darkening"):
-        finite(brush[key], 0, 1, f"brush {key}")
+        brush[key] = unit(brush[key], f"brush {key}")
     for key in ("pressure_size", "pressure_opacity"):
         if type(brush[key]) is not bool:
             raise ValueError(f"{key} requires boolean")
@@ -228,7 +228,7 @@ def validate_points(points, minimum=1):
             raise ValueError(f"Points are pairs [x,y] or triples [x,y,pressure], got {point!r}; "
                              "a flat list [x0,y0,x1,y1,...] is not accepted")
         x, y = finite(point[0], -1000000, 1000000, "point x"), finite(point[1], -1000000, 1000000, "point y")
-        p = finite(point[2], 0, 1, "point pressure") if len(point) == 3 else 1.0
+        p = unit(point[2], "point pressure") if len(point) == 3 else 1.0
         result.append((x, y, p))
     return result
 
@@ -888,7 +888,107 @@ def shape_image(size, obj):
     return out
 
 
-FILTER_KINDS = {"blur", "channel_shift", "noise", "relief"}
+FILTER_KINDS = {"blur", "channel_shift", "noise", "relief", "levels", "threshold", "invert", "hue_saturation"}
+
+
+def levels(image, black=0, white=255, gamma=1.0):
+    """Input levels on the colour channels: black..white stretched to 0..255, then gamma (>1 lightens
+    the midtones). Alpha (coverage) is unchanged."""
+    arr = np.asarray(image, dtype=np.float32)
+    rgb = np.clip((arr[..., :3]-black)/max(white-black, 1e-6), 0, 1)**(1/gamma)
+    arr[..., :3] = rgb*255
+    return Image.fromarray(np.uint8(np.clip(arr+.5, 0, 255)))
+
+
+def threshold(image, level=128):
+    """Hard black and white by luminance (photocopy, stencil, xerox); alpha is unchanged."""
+    arr = np.asarray(image, dtype=np.float32)
+    luminance = arr[..., 0]*.299+arr[..., 1]*.587+arr[..., 2]*.114
+    arr[..., :3] = np.where(luminance >= level, 255, 0)[..., None]
+    return Image.fromarray(np.uint8(arr))
+
+
+def invert(image):
+    """Negative of the colour channels; alpha is unchanged."""
+    arr = np.asarray(image).copy()
+    arr[..., :3] = 255-arr[..., :3]
+    return Image.fromarray(arr)
+
+
+def hue_saturation(image, hue=0.0, saturation=1.0, lightness=0.0):
+    """Rotate hue (degrees), scale saturation (0 = grey, 2 = twice as vivid) and lighten (>0, toward
+    white) or darken (<0, toward black). Alpha is unchanged."""
+    rgba_image = image.convert("RGBA")
+    hsv = np.asarray(rgba_image.convert("RGB").convert("HSV"), dtype=np.float32)
+    hsv[..., 0] = (hsv[..., 0]+hue/360*256) % 256
+    hsv[..., 1] = np.clip(hsv[..., 1]*saturation, 0, 255)
+    rgb = np.asarray(Image.fromarray(np.uint8(hsv+.5), "HSV").convert("RGB"), dtype=np.float32)
+    if lightness > 0:
+        rgb = rgb+(255-rgb)*lightness
+    elif lightness < 0:
+        rgb = rgb*(1+lightness)
+    out = np.concatenate([np.clip(rgb+.5, 0, 255), np.asarray(rgba_image.getchannel("A"), dtype=np.float32)[..., None]], axis=2)
+    return Image.fromarray(np.uint8(out))
+
+
+def _row_distance(on, cap):
+    """Distance along each row to the nearest True pixel, at most cap+1."""
+    width = on.shape[1]
+    index = np.arange(width, dtype=np.int32)
+    far = np.int32(1 << 29)
+    left = np.maximum.accumulate(np.where(on, index, -far), axis=1)
+    right = np.minimum.accumulate(np.where(on, index, far)[:, ::-1], axis=1)[:, ::-1]
+    return np.minimum(np.minimum(index-left, right-index), cap+1).astype(np.int32)
+
+
+def distance_to(on, cap):
+    """Euclidean distance between pixel centres from every pixel to the nearest True pixel, capped at
+    cap+1. Separable: row distances, then the minimum over vertical offsets up to cap."""
+    row = _row_distance(on, cap)
+    squared = row*row
+    best = squared.copy()
+    limit = (cap+1)**2
+    for dy in range(1, min(cap+1, on.shape[0])):
+        add = dy*dy
+        if add >= limit:
+            break
+        np.minimum(best[dy:], squared[:-dy]+add, out=best[dy:])
+        np.minimum(best[:-dy], squared[dy:]+add, out=best[:-dy])
+    return np.sqrt(np.minimum(best, limit).astype(np.float32))
+
+
+def grow_shrink(mask, radius, grow):
+    """Grow or shrink a selection by radius px with a round (Euclidean) structuring element, so round
+    shapes stay round. Edges come out antialiased; the canvas edge is not treated as a boundary."""
+    if radius <= 0:
+        return mask.copy()
+    arr = np.asarray(mask, dtype=np.uint8)
+    inside = arr >= 128
+    cap = int(math.ceil(radius))+1
+    height, width = arr.shape
+    if grow:
+        rows, cols = np.nonzero(inside.any(axis=1))[0], np.nonzero(inside.any(axis=0))[0]
+        if not len(rows):
+            return mask.copy()
+        top, bottom = max(0, rows[0]-cap-1), min(height, rows[-1]+cap+2)
+        left, right = max(0, cols[0]-cap-1), min(width, cols[-1]+cap+2)
+        distance = distance_to(inside[top:bottom, left:right], cap)
+        cover = np.clip(radius+1-distance, 0, 1)
+        part = np.maximum(arr[top:bottom, left:right].astype(np.float32)/255, cover)
+    else:
+        rows, cols = np.nonzero((arr > 0).any(axis=1))[0], np.nonzero((arr > 0).any(axis=0))[0]
+        if not len(rows):
+            return mask.copy()
+        top, bottom = max(0, rows[0]-1), min(height, rows[-1]+2)
+        left, right = max(0, cols[0]-1), min(width, cols[-1]+2)
+        outside = ~inside[top:bottom, left:right]
+        if not outside.any():
+            return mask.copy()  # selected to every canvas edge: nothing to shrink from
+        cover = np.clip(distance_to(outside, cap)-radius, 0, 1)
+        part = np.minimum(arr[top:bottom, left:right].astype(np.float32)/255, cover)
+    out = arr.copy()
+    out[top:bottom, left:right] = np.uint8(part*255+.5)
+    return Image.fromarray(out, "L")
 
 
 def gaussian_blur(image, radius):
@@ -934,12 +1034,13 @@ def add_noise(image, amount, seed, monochrome=True):
     return Image.fromarray(np.uint8(arr))
 
 
-def relief(image, angle=135.0, amount=.5, radius=1.5, source="luminance"):
+def relief(image, angle=135.0, amount=.5, radius=1.5, source="luminance", depth=1.0):
     """Emboss lighting from a height map (luminance or coverage); alpha is unchanged.
 
     angle is the light direction in degrees counter-clockwise from +x (135 = from the upper left,
     as in common editors). Height from luminance lifts brushwork (impasto, carved block, embossed
-    paper); from alpha it raises whole cut shapes (paper layers, stamped foil)."""
+    paper); from alpha it raises whole cut shapes (paper layers, stamped foil). depth multiplies the
+    slopes: gentle painted height maps (carved relief, clay) need 4..20 to show their planes."""
     arr = np.asarray(image, dtype=np.float32)/255
     alpha = arr[..., 3]
     if source == "alpha":
@@ -955,7 +1056,7 @@ def relief(image, angle=135.0, amount=.5, radius=1.5, source="luminance"):
     theta = math.radians(angle)
     lx, ly = math.cos(theta), -math.sin(theta)
     # Slopes rising away from the light face it; scale so a softened unit edge reaches about ±1.
-    shade = np.clip(-(gx*lx+gy*ly)*2.5*max(radius, .5), -1, 1)*amount
+    shade = np.clip(-(gx*lx+gy*ly)*2.5*max(radius, .5)*depth, -1, 1)*amount
     rgb = arr[..., :3]
     lit = np.where(shade[..., None] > 0, rgb+(1-rgb)*shade[..., None], rgb*(1+shade[..., None]))
     out = np.concatenate([np.clip(lit, 0, 1), alpha[..., None]], axis=2)

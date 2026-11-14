@@ -87,6 +87,14 @@ def atomic_write(path, writer, overwrite=True):
 
 
 def save_project(document, path, overwrite=True):
+    """Save the editable project; the document then belongs to this path and counts as saved."""
+    result = write_project(document, path, overwrite)
+    document.path = result; document.saved_revision = document.revision
+    return result
+
+
+def write_project(document, path, overwrite=True):
+    """Write a .apaint copy of the document without changing its path or saved state (keyframes)."""
     if Path(path).suffix.lower() != ".apaint":
         raise ValueError("Editable projects use .apaint; use export for PNG/ORA/PSD")
     metadata=document.info()
@@ -114,9 +122,7 @@ def save_project(document, path, overwrite=True):
             for name, data in zip(names, encode_pngs(images)):
                 archive.writestr(name,data)
             archive.writestr("manifest.json",json.dumps(manifest,ensure_ascii=False,allow_nan=False))
-    result = atomic_write(path,write,overwrite)
-    document.path = result; document.saved_revision = document.revision
-    return result
+    return atomic_write(path,write,overwrite)
 
 
 def open_project(path):

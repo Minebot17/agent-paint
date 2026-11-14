@@ -378,11 +378,14 @@ def test_concurrent_calls_are_serialized(e):
 def test_core_has_no_desktop_imports():
     import csp_headless
     forbidden={"ctypes","win32api","win32gui","win32con","pyautogui","pynput","subprocess","mss","tkinter","PyQt5","PySide6"}
+    # The optional MP4 encoder runs the ffmpeg command-line program; no other module starts processes.
+    allowed={"video.py":{"subprocess"}}
     for path in Path(csp_headless.__file__).parent.glob("*.py"):
         if path.name=="server.py": continue
+        banned=forbidden-allowed.get(path.name,set())
         tree=ast.parse(path.read_text("utf-8"))
         for node in ast.walk(tree):
-            if isinstance(node,ast.Import): assert not any(a.name.split(".")[0] in forbidden for a in node.names)
+            if isinstance(node,ast.Import): assert not any(a.name.split(".")[0] in banned for a in node.names),path.name
             if isinstance(node,ast.ImportFrom):
-                assert (node.module or "").split(".")[0] not in forbidden
+                assert (node.module or "").split(".")[0] not in banned,path.name
                 assert not (node.module=="PIL" and any(a.name=="ImageGrab" for a in node.names))

@@ -1,13 +1,16 @@
 """Owned, editable scene state. No screenshot inference or native window handles."""
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import copy
 from io import BytesIO
 import math
 import os
 import secrets
+import threading
 from PIL import Image, ImageChops
 
 from .tiles import TiledImage
@@ -43,8 +46,42 @@ class ParkedImage:
 BLENDS = {"normal", "multiply", "screen", "overlay", "darken", "lighten", "add", "subtract", "difference", "soft_light"}
 
 
+_IDS = threading.local()  # per-thread id capture (timelapse recording) and replay queue
+
+
 def uid():
-    return secrets.token_hex(8)
+    """Random id of a layer, object or document. A timelapse recording captures the ids a call
+    generates, and its replay hands back the same ids, so later commands that name them still work."""
+    queue = getattr(_IDS, "replay", None)
+    if queue:
+        return queue.popleft()
+    value = secrets.token_hex(8)
+    captured = getattr(_IDS, "capture", None)
+    if captured is not None:
+        captured.append(value)
+    return value
+
+
+@contextmanager
+def capture_ids():
+    """Collect every id uid() generates in this thread inside the block."""
+    previous = getattr(_IDS, "capture", None)
+    ids = _IDS.capture = []
+    try:
+        yield ids
+    finally:
+        _IDS.capture = previous
+
+
+@contextmanager
+def replay_ids(ids):
+    """Make uid() return these ids, in order, inside the block (random ones once they run out)."""
+    previous = getattr(_IDS, "replay", None)
+    _IDS.replay = deque(ids or ())
+    try:
+        yield _IDS.replay
+    finally:
+        _IDS.replay = previous
 
 
 def finite(value, low=None, high=None, name=None):
@@ -54,6 +91,16 @@ def finite(value, low=None, high=None, name=None):
     if low is not None and value < low or high is not None and value > high:
         raise ValueError(f"{label}Number outside {low}..{high} (got {value})")
     return value
+
+
+UNIT_TOLERANCE = .01
+
+
+def unit(value, name=None, low=0.0, high=1.0):
+    """A number in low..high. Scripted plans often overshoot by rounding (1.002, -0.004): values within
+    UNIT_TOLERANCE of the range are clamped instead of failing a whole batch; others are errors."""
+    finite(value, low-UNIT_TOLERANCE, high+UNIT_TOLERANCE, name)
+    return min(high, max(low, value))
 
 
 def dimensions(width, height):
